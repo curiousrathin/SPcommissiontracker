@@ -26,14 +26,7 @@ streamlit run app.py
 ## Notes
 
 - The app loads `Sheet 1` from `FrankieDS.xlsx`.
-- It applies the first load-time filters from the plan:
-  - Payment Status filtering
-  - Smoke Arsenal customer exclusion
-  - Invoice Date conversion from Excel serial dates
-  - Column renaming for `revenue`, `current_sp`, and related fields
-
-## Next steps
-
-- Add key line matching
-- Add rep eligibility and bonus pool allocation
-- Add export and report tabs
+- Place your data file in the project root — it is excluded from version control via `.gitignore`.
+- Applies load-time filters: Smoke Arsenal customer exclusion, Excel serial date conversion, column renaming.
+- Computes spending tiers (Low / Medium / High) from full dataset history before any period filtering.
+- Bonus pool allocation with tier weights, key-line eligibility gate, and per-rep explanation cards.
