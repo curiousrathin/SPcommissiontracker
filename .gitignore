@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Data files — never commit raw sales data
+*.xlsx
+*.csv
+*.xls
+
+# Export outputs
+exports/
