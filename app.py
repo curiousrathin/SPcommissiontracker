@@ -375,11 +375,20 @@ def main():
         st.info("Upload a CSV file using the sidebar to get started.")
         st.stop()
 
-    with st.spinner("Loading data..."):
-        raw_df = load_csv_data(source)
+    try:
+        with st.spinner("Loading data..."):
+            raw_df = load_csv_data(source)
+    except Exception as e:
+        st.error(f"Failed to read CSV: {e}")
+        return
 
-    with st.spinner("Processing..."):
-        df = preprocess_dataset(raw_df)
+    try:
+        with st.spinner("Processing..."):
+            df = preprocess_dataset(raw_df)
+    except Exception as e:
+        st.error(f"Failed to process data: {e}")
+        st.write("**Columns found in your CSV:**", list(raw_df.columns))
+        return
 
     if df["invoice_date"].isna().all():
         st.error("No valid invoice dates found.")
