@@ -7,6 +7,7 @@ __pycache__/
 *.xlsx
 *.csv
 *.xls
+!FrankieDS.csv.gz
 
 # Export outputs
 exports/

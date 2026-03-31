@@ -2,7 +2,7 @@ import pandas as pd
 import streamlit as st
 from pathlib import Path
 
-DEFAULT_FILE = Path("FrankieDS.csv")
+DEFAULT_FILE = Path("FrankieDS.csv.gz")
 EXCLUDE_SP = [
     "Shazia",
     "Nancy",
