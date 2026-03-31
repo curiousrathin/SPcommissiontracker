@@ -372,8 +372,8 @@ def main():
         source = DEFAULT_FILE
         st.sidebar.info(f"Using local file: {DEFAULT_FILE.name}")
     else:
-        st.error("Could not find FrankieDS.csv in the workspace. Upload a file to continue.")
-        return
+        st.info("Upload a CSV file using the sidebar to get started.")
+        st.stop()
 
     with st.spinner("Loading data..."):
         raw_df = load_csv_data(source)
