@@ -148,6 +148,64 @@ def compute_sp_summary(df: pd.DataFrame, current_q: str, prior_q: str | None) ->
             summary[f"{line}_rev"] / line_total * 100 if line_total > 0 else 0.0
         )
 
+    # Attribution: revenue where the raw Salesperson column matches this rep
+    if "Salesperson" in df.columns:
+        attr_rev = (
+            df[df["quarter"] == current_q]
+            .groupby("Salesperson")["revenue"].sum()
+            .rename("attribution_rev")
+        )
+        summary = summary.join(attr_rev, how="left")
+        summary["attribution_rev"] = summary["attribution_rev"].fillna(0.0)
+    else:
+        summary["attribution_rev"] = 0.0
+    summary["attribution_pct"] = summary.apply(
+        lambda r: r["attribution_rev"] / r["cq_revenue"] * 100 if r["cq_revenue"] > 0 else 0.0,
+        axis=1,
+    )
+
+    # New accounts opened this quarter (by current_sp)
+    ever_before = set(df[df["quarter"] < current_q]["Customer"].dropna().unique())
+    new_custs_cq = cq_df[~cq_df["Customer"].isin(ever_before)]
+    new_acct_count = new_custs_cq.groupby("current_sp")["Customer"].nunique().rename("new_accounts")
+    summary = summary.join(new_acct_count, how="left")
+    summary["new_accounts"] = summary["new_accounts"].fillna(0).astype(int)
+
+    # Low spend growth: delta for Low Tier customers active in CQ (same universe both quarters)
+    cq_low_customers = set(
+        cq_df[cq_df["spend_tier"] == "Low Tier"]["Customer"].dropna().unique()
+    )
+    cq_low = (
+        cq_df[cq_df["Customer"].isin(cq_low_customers)]
+        .groupby("current_sp")["revenue"].sum().rename("cq_low_rev")
+    )
+    pq_low = (
+        pq_df[pq_df["Customer"].isin(cq_low_customers)]
+        .groupby("current_sp")["revenue"].sum().rename("pq_low_rev")
+        if not pq_df.empty else pd.Series(dtype=float, name="pq_low_rev")
+    )
+    low_tbl = cq_low.to_frame().join(pq_low, how="left").fillna(0.0)
+    low_tbl["low_spend_growth"] = low_tbl["cq_low_rev"] - low_tbl["pq_low_rev"]
+    summary = summary.join(low_tbl["low_spend_growth"], how="left")
+    summary["low_spend_growth"] = summary["low_spend_growth"].fillna(0.0)
+
+    # Reactivated accounts count (by current_sp): absent last quarter, seen before
+    pq_customers = (
+        set(df[df["quarter"] == prior_q]["Customer"].dropna().unique())
+        if prior_q else set()
+    )
+    pre_pq_cutoff = prior_q if prior_q else current_q
+    pre_pq_customers = set(df[df["quarter"] < pre_pq_cutoff]["Customer"].dropna().unique())
+    cq_all_customers = set(cq_df["Customer"].dropna().unique())
+    reactivated = (cq_all_customers - pq_customers) & pre_pq_customers
+    react_count = (
+        cq_df[cq_df["Customer"].isin(reactivated)]
+        .groupby("current_sp")["Customer"].nunique()
+        .rename("reactivated_count")
+    )
+    summary = summary.join(react_count, how="left")
+    summary["reactivated_count"] = summary["reactivated_count"].fillna(0).astype(int)
+
     summary = summary.reset_index().rename(columns={"current_sp": "Salesperson"})
     return summary.sort_values("cq_revenue", ascending=False)
 
@@ -272,11 +330,33 @@ def compute_reactivated_accounts_table(df: pd.DataFrame, current_q: str, prior_q
     return table.sort_values("cq_revenue", ascending=False)
 
 
-def compute_bonus_allocation(selected_reps: list, rep_revenues: dict, pool: float) -> pd.DataFrame:
-    rows = [{"Salesperson": r, "revenue": rep_revenues.get(r, 0.0)} for r in selected_reps]
-    alloc = pd.DataFrame(rows)
-    total = alloc["revenue"].sum()
-    alloc["share"] = alloc["revenue"] / total if total > 0 else 0.0
+WEIGHTS = {"new_accounts": 0.4, "low_spend_growth": 0.3, "reactivated_count": 0.3}
+
+
+def compute_bonus_allocation(selected_reps: list, sp_metrics: pd.DataFrame, pool: float) -> pd.DataFrame:
+    alloc = sp_metrics[sp_metrics["Salesperson"].isin(selected_reps)][
+        ["Salesperson", "new_accounts", "low_spend_growth", "reactivated_count"]
+    ].copy()
+
+    # Negative low spend growth doesn't contribute
+    alloc["low_spend_growth"] = alloc["low_spend_growth"].clip(lower=0)
+
+    total_new = alloc["new_accounts"].sum()
+    total_low = alloc["low_spend_growth"].sum()
+    total_react = alloc["reactivated_count"].sum()
+
+    alloc["new_share"] = alloc["new_accounts"] / total_new if total_new > 0 else 0.0
+    alloc["low_share"] = alloc["low_spend_growth"] / total_low if total_low > 0 else 0.0
+    alloc["react_share"] = alloc["reactivated_count"] / total_react if total_react > 0 else 0.0
+
+    alloc["score"] = (
+        WEIGHTS["new_accounts"] * alloc["new_share"]
+        + WEIGHTS["low_spend_growth"] * alloc["low_share"]
+        + WEIGHTS["reactivated_count"] * alloc["react_share"]
+    )
+
+    total_score = alloc["score"].sum()
+    alloc["share"] = alloc["score"] / total_score if total_score > 0 else 0.0
     alloc["bonus"] = alloc["share"] * pool
     return alloc.sort_values("bonus", ascending=False)
 
@@ -377,21 +457,29 @@ def main():
 
     sp_df = compute_sp_summary(df, current_q, prior_q)
 
-    sp_display = sp_df[["Salesperson", "pq_revenue", "cq_revenue", "growth_pct"]].copy()
-    sp_display["pq_revenue"] = sp_display["pq_revenue"].apply(fmt)
+    sp_display = sp_df[[
+        "Salesperson", "cq_revenue", "growth_pct",
+        "attribution_rev", "attribution_pct",
+        "new_accounts", "low_spend_growth", "reactivated_count",
+    ]].copy()
     sp_display["cq_revenue"] = sp_display["cq_revenue"].apply(fmt)
     sp_display["growth_pct"] = sp_display["growth_pct"].apply(
         lambda v: f"{v:+.1f}%" if v is not None else "—"
     )
+    sp_display["attribution_rev"] = sp_display["attribution_rev"].apply(fmt)
+    sp_display["attribution_pct"] = sp_display["attribution_pct"].apply(lambda v: f"{v:.1f}%")
+    sp_display["low_spend_growth"] = sp_display["low_spend_growth"].apply(
+        lambda v: f"+{fmt(v)}" if v >= 0 else f"-${abs(v):,.0f}"
+    )
     sp_display = sp_display.rename(columns={
-        "pq_revenue": f"{pq_label} Revenue",
         "cq_revenue": f"{cq_label} Revenue",
         "growth_pct": "Growth",
+        "attribution_rev": "Attribution ($)",
+        "attribution_pct": "Attribution (%)",
+        "new_accounts": "New Accounts",
+        "low_spend_growth": "Low Spend Growth",
+        "reactivated_count": "Reactivated",
     })
-    for line in KEY_PRODUCT_LINES:
-        sp_display[f"{line} contrib"] = sp_df[f"{line}_pct"].apply(
-            lambda v: f"{v:.1f}%" if v > 0 else "—"
-        )
 
     st.dataframe(sp_display, use_container_width=True, hide_index=True)
 
@@ -541,16 +629,13 @@ def main():
 
     # ── Bonus Allocation ───────────────────────────────────────────────────────
     st.subheader("Bonus allocation")
-
-    cq_df = df[df["quarter"] == current_q]
-    rep_revenues = (
-        cq_df[~cq_df["current_sp"].isin(EXCLUDE_SP)]
-        .groupby("current_sp")["revenue"]
-        .sum()
-        .sort_values(ascending=False)
-        .to_dict()
+    st.caption(
+        f"Weighted score: New Accounts {int(WEIGHTS['new_accounts']*100)}% · "
+        f"Low Spend Growth {int(WEIGHTS['low_spend_growth']*100)}% · "
+        f"Reactivated {int(WEIGHTS['reactivated_count']*100)}%"
     )
-    all_reps = list(rep_revenues.keys())
+
+    all_reps = sp_df["Salesperson"].tolist()
 
     selected_reps = st.multiselect(
         "Salespeople in bonus pool",
@@ -570,18 +655,26 @@ def main():
         st.warning("Select at least one salesperson.")
         return
 
-    alloc_df = compute_bonus_allocation(selected_reps, rep_revenues, pool)
+    alloc_df = compute_bonus_allocation(selected_reps, sp_df, pool)
 
     a1, a2 = st.columns(2)
     a1.metric("Reps in pool", len(selected_reps))
     a2.metric("Total allocated", fmt(alloc_df["bonus"].sum()))
 
     display = alloc_df.copy()
-    display["revenue"] = display["revenue"].apply(fmt)
-    display["share"] = (display["share"] * 100).round(2).astype(str) + "%"
+    display["low_spend_growth"] = display["low_spend_growth"].apply(fmt)
+    display["score"] = (display["score"] * 100).round(1).astype(str) + "%"
+    display["share"] = (display["share"] * 100).round(1).astype(str) + "%"
     display["bonus"] = display["bonus"].apply(fmt)
     st.dataframe(
-        display.rename(columns={"revenue": "Revenue", "share": "Share", "bonus": "Bonus"}),
+        display.rename(columns={
+            "new_accounts": "New Accounts",
+            "low_spend_growth": "Low Spend Growth",
+            "reactivated_count": "Reactivated",
+            "score": "Weighted Score",
+            "share": "Pool Share",
+            "bonus": "Bonus",
+        }),
         use_container_width=True,
         hide_index=True,
     )
