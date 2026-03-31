@@ -52,6 +52,10 @@ def preprocess_dataset(df: pd.DataFrame) -> pd.DataFrame:
         "Customer Tier": "customer_tier",
         "Account Type": "account_type",
     })
+
+    # Normalize customer names to title case to avoid duplicates from casing differences
+    df["Customer"] = df["Customer"].str.strip().str.title()
+
     df["quarter"] = df["invoice_date"].dt.to_period("Q").astype(str)
 
     # Normalize account type — blank/missing becomes Individual Store
