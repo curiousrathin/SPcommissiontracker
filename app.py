@@ -60,6 +60,11 @@ def preprocess_dataset(df: pd.DataFrame) -> pd.DataFrame:
         .apply(lambda v: "Franchise" if v == "Franchise" else "Individual Store")
     )
 
+    # Fill NaN in string columns before converting to categorical
+    for col in ["current_sp", "Salesperson", "product", "customer_tier", "account_type", "Customer"]:
+        if col in df.columns:
+            df[col] = df[col].fillna("")
+
     # Convert high-cardinality string columns to categoricals to save memory
     for col in ["current_sp", "Salesperson", "product", "customer_tier", "account_type", "Customer"]:
         if col in df.columns:
