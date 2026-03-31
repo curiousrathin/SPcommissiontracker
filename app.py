@@ -22,18 +22,31 @@ st.set_page_config(page_title="Smoke Arsenal Incentive Tool", layout="wide")
 st.title("Smoke Arsenal — Incentive Allocation")
 
 
+REQUIRED_COLUMNS = {
+    "Customer", "Invoice Date", "Untaxed Total",
+    "Current Salesperson", "Salesperson", "Product",
+    "Customer Tier", "Account Type",
+}
+
+
 @st.cache_data(show_spinner=False)
 def load_csv_data(source):
-    return pd.read_csv(source)
+    # Read only the columns the app actually needs, drop everything else immediately
+    raw = pd.read_csv(source, dtype=str)
+    keep = [c for c in raw.columns if c in REQUIRED_COLUMNS]
+    return raw[keep]
 
 
 @st.cache_data(show_spinner=False)
 def preprocess_dataset(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df = df[~df["Customer"].astype(str).str.contains("smoke arsenal", case=False, na=False)]
+    df = df[~df["Customer"].str.contains("smoke arsenal", case=False, na=False)]
+
     df["invoice_date"] = pd.to_datetime(df["Invoice Date"], errors="coerce")
+    df["revenue"] = pd.to_numeric(df["Untaxed Total"], errors="coerce").fillna(0.0).astype("float32")
+    df = df.drop(columns=["Invoice Date", "Untaxed Total"])
+
     df = df.rename(columns={
-        "Untaxed Total": "revenue",
         "Current Salesperson": "current_sp",
         "Product": "product",
         "Customer Tier": "customer_tier",
@@ -47,11 +60,16 @@ def preprocess_dataset(df: pd.DataFrame) -> pd.DataFrame:
         .apply(lambda v: "Franchise" if v == "Franchise" else "Individual Store")
     )
 
+    # Convert high-cardinality string columns to categoricals to save memory
+    for col in ["current_sp", "Salesperson", "product", "customer_tier", "account_type", "quarter", "Customer"]:
+        if col in df.columns:
+            df[col] = df[col].astype("category")
+
     # Spend Tier — based on each customer's average quarterly revenue across 2025
-    df_2025 = df[df["quarter"].str.startswith("2025")]
+    df_2025 = df[df["quarter"].astype(str).str.startswith("2025")]
     n_2025_q = df_2025["quarter"].nunique() or 1
     cust_2025_avg = (
-        df_2025.groupby("Customer")["revenue"].sum() / n_2025_q
+        df_2025.groupby("Customer", observed=True)["revenue"].sum() / n_2025_q
     ).rename("_avg_2025_q")
 
     def _spend_tier(avg: float) -> str:
@@ -63,7 +81,7 @@ def preprocess_dataset(df: pd.DataFrame) -> pd.DataFrame:
 
     spend_tier_map = cust_2025_avg.apply(_spend_tier).rename("spend_tier")
     df = df.join(spend_tier_map, on="Customer")
-    df["spend_tier"] = df["spend_tier"].fillna("Low Tier")
+    df["spend_tier"] = df["spend_tier"].fillna("Low Tier").astype("category")
 
     return df
 
