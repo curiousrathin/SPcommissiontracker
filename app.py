@@ -3,20 +3,8 @@ import streamlit as st
 from pathlib import Path
 
 DEFAULT_FILE = Path("FrankieDS.csv.gz")
-EXCLUDE_SP = [
-    "Shazia",
-    "Nancy",
-    "Shahvar",
-    "House",
-    "BC Accounts",
-    "Company Pool",
-    "Dakota (Staff Account)",
-    "Anas",
-    "SMOKE ARSENAL BC",
-    "Smoke Arsenal QC",
-    "Bc Smoke Arsenal",
-]
 KEY_PRODUCT_LINES = ["BC10K", "GH20K", "Nuud 50K"]
+OTHER_SP_THRESHOLD = 30_000  # SPs with < this in current quarter → grouped as "Other"
 
 st.set_page_config(page_title="Smoke Arsenal Incentive Tool", layout="wide")
 st.title("Smoke Arsenal — Incentive Allocation")
@@ -31,7 +19,6 @@ REQUIRED_COLUMNS = {
 
 @st.cache_data(show_spinner=False)
 def load_csv_data(source):
-    # Read only the columns the app actually needs, drop everything else immediately
     raw = pd.read_csv(source, dtype=str)
     keep = [c for c in raw.columns if c in REQUIRED_COLUMNS]
     return raw[keep]
@@ -40,6 +27,7 @@ def load_csv_data(source):
 @st.cache_data(show_spinner=False)
 def preprocess_dataset(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    # Only exclusion: rows where Customer contains "smoke arsenal" (any casing)
     df = df[~df["Customer"].str.contains("smoke arsenal", case=False, na=False)]
 
     df["invoice_date"] = pd.to_datetime(df["Invoice Date"], errors="coerce")
@@ -53,23 +41,18 @@ def preprocess_dataset(df: pd.DataFrame) -> pd.DataFrame:
         "Account Type": "account_type",
     })
 
-    # Normalize customer names to title case to avoid duplicates from casing differences
     df["Customer"] = df["Customer"].str.strip().str.title()
-
     df["quarter"] = df["invoice_date"].dt.to_period("Q").astype(str)
 
-    # Normalize account type — blank/missing becomes Individual Store
     df["account_type"] = (
         df["account_type"].fillna("").str.strip()
         .apply(lambda v: "Franchise" if v == "Franchise" else "Individual Store")
     )
 
-    # Fill NaN in string columns before converting to categorical
     for col in ["current_sp", "Salesperson", "product", "customer_tier", "account_type", "Customer"]:
         if col in df.columns:
             df[col] = df[col].fillna("")
 
-    # Convert high-cardinality string columns to categoricals to save memory
     for col in ["current_sp", "Salesperson", "product", "customer_tier", "account_type", "Customer"]:
         if col in df.columns:
             df[col] = df[col].astype("category")
@@ -95,8 +78,67 @@ def preprocess_dataset(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(show_spinner=False)
+def apply_sp_grouping(df: pd.DataFrame, current_q: str) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Relabel current_sp to 'Other' for any SP whose total revenue in current_q
+    is below OTHER_SP_THRESHOLD. Returns the modified df and a sorted list of
+    the original SP names that were moved into 'Other'.
+    """
+    df = df.copy()
+    cq_sp_rev = (
+        df[df["quarter"] == current_q]
+        .groupby("current_sp", observed=True)["revenue"]
+        .sum()
+    )
+    qualified = set(cq_sp_rev[cq_sp_rev >= OTHER_SP_THRESHOLD].index.tolist())
+    # Collect names that go into Other (skip blank)
+    all_sps = set(cq_sp_rev.index.tolist())
+    other_sps = sorted(sp for sp in (all_sps - qualified) if sp != "")
+
+    def _remap(sp: str) -> str:
+        return sp if sp in qualified else "Other"
+
+    df["current_sp"] = df["current_sp"].astype(str).apply(_remap).astype("category")
+    return df, other_sps
+
+
 def fmt(value: float) -> str:
     return f"${value:,.0f}"
+
+
+def get_new_accounts_df(df: pd.DataFrame, current_q: str) -> pd.DataFrame:
+    """
+    Returns a DataFrame of genuinely new accounts in current_q.
+
+    A new account qualifies only when BOTH conditions hold:
+      1. The customer's very first invoice in the entire dataset falls in current_q.
+      2. The current_sp on that first invoice is also the Salesperson on that invoice
+         (i.e. the rep who owns the account today was the one who made the first sale).
+
+    Returns one row per customer with columns: Customer, current_sp.
+    """
+    cq_df = df[df["quarter"] == current_q]
+    ever_before = set(df[df["quarter"] < current_q]["Customer"].dropna().unique())
+    new_custs = cq_df[~cq_df["Customer"].isin(ever_before)]
+
+    if new_custs.empty:
+        return pd.DataFrame(columns=["Customer", "current_sp"])
+
+    # For each new customer, grab their first invoice in current_q
+    first_inv = (
+        new_custs.sort_values("invoice_date")
+        .groupby("Customer", observed=True)[["current_sp", "Salesperson"]]
+        .first()
+        .reset_index()
+    )
+
+    # Only credit if current_sp == Salesperson on the first invoice
+    credited = first_inv[
+        first_inv["current_sp"].astype(str) == first_inv["Salesperson"].astype(str)
+    ][["Customer", "current_sp"]]
+
+    return credited
 
 
 def compute_kpis(df: pd.DataFrame, current_q: str, prior_q: str | None) -> dict:
@@ -107,9 +149,8 @@ def compute_kpis(df: pd.DataFrame, current_q: str, prior_q: str | None) -> dict:
     prior_rev = pq_df["revenue"].sum()
     growth_pct = (current_rev - prior_rev) / prior_rev * 100 if prior_rev > 0 else None
 
-    cq_customers = set(cq_df["Customer"].dropna().unique())
-    ever_before = set(df[df["quarter"] < current_q]["Customer"].dropna().unique())
-    new_accounts = cq_customers - ever_before
+    new_accounts_df = get_new_accounts_df(df, current_q)
+    new_accounts = set(new_accounts_df["Customer"].unique())
     new_account_count = len(new_accounts)
 
     df_2025 = df[df["quarter"].str.startswith("2025")]
@@ -121,6 +162,7 @@ def compute_kpis(df: pd.DataFrame, current_q: str, prior_q: str | None) -> dict:
     grew_count = sum(1 for c, r in existing_cq.items() if r > cust_2025_avg.get(c, 0))
     declined_count = sum(1 for c, r in existing_cq.items() if r < cust_2025_avg.get(c, 0))
 
+    cq_customers = set(cq_df["Customer"].dropna().unique())
     pq_customers = set(pq_df["Customer"].dropna().unique()) if not pq_df.empty else set()
     inactive_count = len(pq_customers - cq_customers)
 
@@ -146,15 +188,12 @@ def compute_kpis(df: pd.DataFrame, current_q: str, prior_q: str | None) -> dict:
 
 
 def compute_sp_summary(df: pd.DataFrame, current_q: str, prior_q: str | None) -> pd.DataFrame:
-    cq_df = df[(df["quarter"] == current_q) & (~df["current_sp"].isin(EXCLUDE_SP))]
-    pq_df = (
-        df[(df["quarter"] == prior_q) & (~df["current_sp"].isin(EXCLUDE_SP))]
-        if prior_q else pd.DataFrame(columns=df.columns)
-    )
+    cq_df = df[df["quarter"] == current_q]
+    pq_df = df[df["quarter"] == prior_q] if prior_q else pd.DataFrame(columns=df.columns)
 
-    cq_rev = cq_df.groupby("current_sp")["revenue"].sum().rename("cq_revenue")
+    cq_rev = cq_df.groupby("current_sp", observed=True)["revenue"].sum().rename("cq_revenue")
     pq_rev = (
-        pq_df.groupby("current_sp")["revenue"].sum().rename("pq_revenue")
+        pq_df.groupby("current_sp", observed=True)["revenue"].sum().rename("pq_revenue")
         if not pq_df.empty else pd.Series(dtype=float, name="pq_revenue")
     )
 
@@ -168,7 +207,7 @@ def compute_sp_summary(df: pd.DataFrame, current_q: str, prior_q: str | None) ->
     for line in KEY_PRODUCT_LINES:
         mask = cq_df["product"].fillna("").str.contains(line, case=False)
         line_total = cq_df.loc[mask, "revenue"].sum()
-        rep_line = cq_df[mask].groupby("current_sp")["revenue"].sum()
+        rep_line = cq_df[mask].groupby("current_sp", observed=True)["revenue"].sum()
         summary[f"{line}_rev"] = rep_line
         summary[f"{line}_rev"] = summary[f"{line}_rev"].fillna(0.0)
         summary[f"{line}_pct"] = (
@@ -179,7 +218,7 @@ def compute_sp_summary(df: pd.DataFrame, current_q: str, prior_q: str | None) ->
     if "Salesperson" in df.columns:
         attr_rev = (
             df[df["quarter"] == current_q]
-            .groupby("Salesperson")["revenue"].sum()
+            .groupby("Salesperson", observed=True)["revenue"].sum()
             .rename("attribution_rev")
         )
         summary = summary.join(attr_rev, how="left")
@@ -191,10 +230,11 @@ def compute_sp_summary(df: pd.DataFrame, current_q: str, prior_q: str | None) ->
         axis=1,
     )
 
-    # New accounts opened this quarter (by current_sp)
-    ever_before = set(df[df["quarter"] < current_q]["Customer"].dropna().unique())
-    new_custs_cq = cq_df[~cq_df["Customer"].isin(ever_before)]
-    new_acct_count = new_custs_cq.groupby("current_sp")["Customer"].nunique().rename("new_accounts")
+    # New accounts: customer first appeared this quarter AND current_sp was the first Salesperson
+    new_acct_df = get_new_accounts_df(df, current_q)
+    new_acct_count = (
+        new_acct_df.groupby("current_sp", observed=True)["Customer"].nunique().rename("new_accounts")
+    )
     summary = summary.join(new_acct_count, how="left")
     summary["new_accounts"] = summary["new_accounts"].fillna(0).astype(int)
 
@@ -204,11 +244,11 @@ def compute_sp_summary(df: pd.DataFrame, current_q: str, prior_q: str | None) ->
     )
     cq_low = (
         cq_df[cq_df["Customer"].isin(cq_low_customers)]
-        .groupby("current_sp")["revenue"].sum().rename("cq_low_rev")
+        .groupby("current_sp", observed=True)["revenue"].sum().rename("cq_low_rev")
     )
     pq_low = (
         pq_df[pq_df["Customer"].isin(cq_low_customers)]
-        .groupby("current_sp")["revenue"].sum().rename("pq_low_rev")
+        .groupby("current_sp", observed=True)["revenue"].sum().rename("pq_low_rev")
         if not pq_df.empty else pd.Series(dtype=float, name="pq_low_rev")
     )
     low_tbl = cq_low.to_frame().join(pq_low, how="left").fillna(0.0)
@@ -227,7 +267,7 @@ def compute_sp_summary(df: pd.DataFrame, current_q: str, prior_q: str | None) ->
     reactivated = (cq_all_customers - pq_customers) & pre_pq_customers
     react_count = (
         cq_df[cq_df["Customer"].isin(reactivated)]
-        .groupby("current_sp")["Customer"].nunique()
+        .groupby("current_sp", observed=True)["Customer"].nunique()
         .rename("reactivated_count")
     )
     summary = summary.join(react_count, how="left")
@@ -238,23 +278,21 @@ def compute_sp_summary(df: pd.DataFrame, current_q: str, prior_q: str | None) ->
 
 
 def compute_customer_table(df: pd.DataFrame, current_q: str, prior_q: str | None) -> pd.DataFrame:
-    # Exclude internal/admin accounts AND unassigned rows so the universe matches the SP table
-    df = df[df["current_sp"].notna() & ~df["current_sp"].isin(EXCLUDE_SP)]
     cq_df = df[df["quarter"] == current_q]
     pq_df = df[df["quarter"] == prior_q] if prior_q else pd.DataFrame(columns=df.columns)
 
-    cq_rev = cq_df.groupby("Customer")["revenue"].sum().rename("cq_revenue")
+    cq_rev = cq_df.groupby("Customer", observed=True)["revenue"].sum().rename("cq_revenue")
     pq_rev = (
-        pq_df.groupby("Customer")["revenue"].sum().rename("pq_revenue")
+        pq_df.groupby("Customer", observed=True)["revenue"].sum().rename("pq_revenue")
         if not pq_df.empty else pd.Series(dtype=float, name="pq_revenue")
     )
 
     df_2025 = df[df["quarter"].str.startswith("2025")]
     n_2025_q = df_2025["quarter"].nunique() or 1
-    avg_2025 = (df_2025.groupby("Customer")["revenue"].sum() / n_2025_q).rename("avg_2025_q")
+    avg_2025 = (df_2025.groupby("Customer", observed=True)["revenue"].sum() / n_2025_q).rename("avg_2025_q")
 
     meta_cols = ["current_sp", "spend_tier", "account_type", "customer_tier"]
-    cq_meta = cq_df.sort_values("invoice_date").groupby("Customer")[meta_cols].last()
+    cq_meta = cq_df.sort_values("invoice_date").groupby("Customer", observed=True)[meta_cols].last()
 
     table = (
         cq_rev.to_frame()
@@ -273,24 +311,19 @@ def compute_customer_table(df: pd.DataFrame, current_q: str, prior_q: str | None
 
 
 def compute_sp_table(df: pd.DataFrame, current_q: str, prior_q: str | None) -> pd.DataFrame:
-    sp_df = df[df["current_sp"].notna() & ~df["current_sp"].isin(EXCLUDE_SP)]
-    cq_df = sp_df[sp_df["quarter"] == current_q]
-    pq_df = sp_df[sp_df["quarter"] == prior_q] if prior_q else pd.DataFrame(columns=df.columns)
+    cq_df = df[df["quarter"] == current_q]
+    pq_df = df[df["quarter"] == prior_q] if prior_q else pd.DataFrame(columns=df.columns)
 
-    cq_rev = cq_df.groupby("current_sp")["revenue"].sum().rename("cq_revenue")
+    cq_rev = cq_df.groupby("current_sp", observed=True)["revenue"].sum().rename("cq_revenue")
 
-    # Only count prior-quarter revenue for customers active in the current quarter
-    # so totals stay comparable to the customer table (which left-joins on CQ customers)
-    cq_customers = set(cq_df["Customer"].dropna().unique())
     pq_rev = (
-        pq_df[pq_df["Customer"].isin(cq_customers)]
-        .groupby("current_sp")["revenue"].sum().rename("pq_revenue")
+        pq_df.groupby("current_sp", observed=True)["revenue"].sum().rename("pq_revenue")
         if not pq_df.empty else pd.Series(dtype=float, name="pq_revenue")
     )
 
-    df_2025 = sp_df[sp_df["quarter"].str.startswith("2025")]
+    df_2025 = df[df["quarter"].str.startswith("2025")]
     n_2025_q = df_2025["quarter"].nunique() or 1
-    avg_2025 = (df_2025.groupby("current_sp")["revenue"].sum() / n_2025_q).rename("avg_2025_q")
+    avg_2025 = (df_2025.groupby("current_sp", observed=True)["revenue"].sum() / n_2025_q).rename("avg_2025_q")
 
     table = (
         cq_rev.to_frame()
@@ -309,47 +342,41 @@ def compute_sp_table(df: pd.DataFrame, current_q: str, prior_q: str | None) -> p
 
 
 def compute_new_accounts_table(df: pd.DataFrame, current_q: str) -> pd.DataFrame:
-    """Customers whose very first invoice in the entire dataset falls in current_q."""
-    base = df[df["current_sp"].notna() & ~df["current_sp"].isin(EXCLUDE_SP)]
-    cq_df = base[base["quarter"] == current_q]
-    ever_before = set(base[base["quarter"] < current_q]["Customer"].dropna().unique())
-    new_customers = set(cq_df["Customer"].dropna().unique()) - ever_before
+    credited = get_new_accounts_df(df, current_q)
+    if credited.empty:
+        return pd.DataFrame(columns=["Customer", "current_sp", "spend_tier", "account_type", "customer_tier", "cq_revenue"])
 
+    new_customers = set(credited["Customer"].unique())
+    cq_df = df[df["quarter"] == current_q]
     cq_new = cq_df[cq_df["Customer"].isin(new_customers)]
-    rev = cq_new.groupby("Customer")["revenue"].sum().rename("cq_revenue")
+
+    rev = cq_new.groupby("Customer", observed=True)["revenue"].sum().rename("cq_revenue")
     meta_cols = ["current_sp", "spend_tier", "account_type", "customer_tier"]
-    meta = cq_new.sort_values("invoice_date").groupby("Customer")[meta_cols].last()
+    meta = cq_new.sort_values("invoice_date").groupby("Customer", observed=True)[meta_cols].last()
     table = rev.to_frame().join(meta).reset_index()
     return table.sort_values("cq_revenue", ascending=False)
 
 
 def compute_reactivated_accounts_table(df: pd.DataFrame, current_q: str, prior_q: str | None) -> pd.DataFrame:
-    """Customers active in current_q, absent in prior_q, but with history before prior_q."""
-    base = df[df["current_sp"].notna() & ~df["current_sp"].isin(EXCLUDE_SP)]
-    cq_df = base[base["quarter"] == current_q]
+    cq_df = df[df["quarter"] == current_q]
     pq_customers = (
-        set(base[base["quarter"] == prior_q]["Customer"].dropna().unique())
+        set(df[df["quarter"] == prior_q]["Customer"].dropna().unique())
         if prior_q else set()
     )
     pre_pq_cutoff = prior_q if prior_q else current_q
-    pre_pq_customers = set(
-        base[base["quarter"] < pre_pq_cutoff]["Customer"].dropna().unique()
-    )
+    pre_pq_customers = set(df[df["quarter"] < pre_pq_cutoff]["Customer"].dropna().unique())
 
     cq_customers = set(cq_df["Customer"].dropna().unique())
-    # Active now, absent last quarter, but seen before last quarter
-    reactivated = cq_customers - pq_customers
-    reactivated = reactivated & pre_pq_customers
+    reactivated = (cq_customers - pq_customers) & pre_pq_customers
 
     cq_react = cq_df[cq_df["Customer"].isin(reactivated)]
-    rev = cq_react.groupby("Customer")["revenue"].sum().rename("cq_revenue")
+    rev = cq_react.groupby("Customer", observed=True)["revenue"].sum().rename("cq_revenue")
     meta_cols = ["current_sp", "spend_tier", "account_type", "customer_tier"]
-    meta = cq_react.sort_values("invoice_date").groupby("Customer")[meta_cols].last()
+    meta = cq_react.sort_values("invoice_date").groupby("Customer", observed=True)[meta_cols].last()
 
-    # Last active quarter before current
     last_active = (
-        base[base["Customer"].isin(reactivated) & (base["quarter"] < current_q)]
-        .groupby("Customer")["quarter"].max()
+        df[df["Customer"].isin(reactivated) & (df["quarter"] < current_q)]
+        .groupby("Customer", observed=True)["quarter"].max()
         .rename("last_active_q")
     )
 
@@ -365,7 +392,6 @@ def compute_bonus_allocation(selected_reps: list, sp_metrics: pd.DataFrame, pool
         ["Salesperson", "new_accounts", "low_spend_growth", "reactivated_count"]
     ].copy()
 
-    # Negative low spend growth doesn't contribute
     alloc["low_spend_growth"] = alloc["low_spend_growth"].clip(lower=0)
 
     total_new = alloc["new_accounts"].sum()
@@ -388,73 +414,88 @@ def compute_bonus_allocation(selected_reps: list, sp_metrics: pd.DataFrame, pool
     return alloc.sort_values("bonus", ascending=False)
 
 
-def main():
-    st.sidebar.header("Data source")
-    uploaded_file = st.sidebar.file_uploader("Upload a CSV file", type=["csv"])
+def compute_account_summary(df: pd.DataFrame, current_q: str, prior_q: str | None) -> pd.DataFrame:
+    """Build a management summary grouped by Account Type > Customer Tier > Spend Tier.
 
-    if uploaded_file is not None:
-        source = uploaded_file
-        st.sidebar.success("Using uploaded file")
-    elif DEFAULT_FILE.exists():
-        source = DEFAULT_FILE
-        st.sidebar.info(f"Using local file: {DEFAULT_FILE.name}")
+    Uses groupby on the actual data so no rows are ever silently dropped.
+    The grand total is computed directly from the full quarter slices to match KPIs exactly.
+    """
+    cq_df = df[df["quarter"] == current_q]
+    pq_df = df[df["quarter"] == prior_q] if prior_q else pd.DataFrame(columns=df.columns)
+
+    GROUP_COLS = ["account_type", "customer_tier", "spend_tier"]
+
+    # Aggregate current quarter
+    cq_agg = (
+        cq_df.groupby(GROUP_COLS, observed=True)
+        .agg(cq_count=("Customer", "nunique"), cq_rev=("revenue", "sum"))
+        .reset_index()
+    )
+
+    # Aggregate prior quarter
+    if not pq_df.empty:
+        pq_agg = (
+            pq_df.groupby(GROUP_COLS, observed=True)["revenue"]
+            .sum()
+            .reset_index()
+            .rename(columns={"revenue": "pq_rev"})
+        )
     else:
-        st.info("Upload a CSV file using the sidebar to get started.")
-        st.stop()
+        pq_agg = pd.DataFrame(columns=GROUP_COLS + ["pq_rev"])
 
-    try:
-        with st.spinner("Loading data..."):
-            raw_df = load_csv_data(source)
-    except Exception as e:
-        st.error(f"Failed to read CSV: {e}")
-        return
+    merged = cq_agg.merge(pq_agg, on=GROUP_COLS, how="left").fillna({"pq_rev": 0.0})
 
-    try:
-        with st.spinner("Processing..."):
-            df = preprocess_dataset(raw_df)
-    except Exception as e:
-        st.error(f"Failed to process data: {e}")
-        st.write("**Columns found in your CSV:**", list(raw_df.columns))
-        return
+    # Sort order: Franchise first, then Individual Store;
+    # within Franchise: Bronze → Silver → Gold → anything else;
+    # within each group: Low Tier → Medium Tier → High Tier
+    ACCT_ORDER = {"Franchise": 0, "Individual Store": 1}
+    TIER_ORDER = {"Bronze": 0, "Silver": 1, "Gold": 2}
+    SPEND_ORDER = {"Low Tier": 0, "Medium Tier": 1, "High Tier": 2}
 
-    if df["invoice_date"].isna().all():
-        st.error("No valid invoice dates found.")
-        return
-
-    quarter_list = sorted(df["quarter"].dropna().unique())
-    current_q = quarter_list[-1]
-    prior_quarters = [q for q in quarter_list if q < current_q]
-    prior_q = prior_quarters[-1] if prior_quarters else None
-
-    # ── Sidebar filters ────────────────────────────────────────────────────────
-    st.sidebar.markdown("---")
-    st.sidebar.header("Filters")
-
-    all_account_types = ["Franchise", "Individual Store"]
-    sel_account_types = st.sidebar.multiselect(
-        "Account type", options=all_account_types, default=all_account_types
+    merged["_acct_sort"] = merged["account_type"].astype(str).map(ACCT_ORDER).fillna(99).astype(int)
+    merged["_tier_sort"] = merged["customer_tier"].astype(str).map(TIER_ORDER).fillna(99).astype(int)
+    merged["_spend_sort"] = merged["spend_tier"].astype(str).map(SPEND_ORDER).fillna(99).astype(int)
+    merged = merged.sort_values(["_acct_sort", "_tier_sort", "_spend_sort"]).drop(
+        columns=["_acct_sort", "_tier_sort", "_spend_sort"]
     )
 
-    all_spend_tiers = ["High Tier", "Medium Tier", "Low Tier"]
-    sel_spend_tiers = st.sidebar.multiselect(
-        "Spend tier", options=all_spend_tiers, default=all_spend_tiers
-    )
+    # Build display rows with label-suppression for repeated account/tier values
+    rows = []
+    prev_acct = prev_tier = None
+    for _, r in merged.iterrows():
+        acct = r["account_type"]
+        tier = r["customer_tier"]
+        growth = (r["cq_rev"] - r["pq_rev"]) / r["pq_rev"] * 100 if r["pq_rev"] > 0 else None
+        rows.append({
+            "Account Type": acct if acct != prev_acct else "",
+            "Customer Tier": tier if (acct, tier) != (prev_acct, prev_tier) else "",
+            "Spend Tier": r["spend_tier"],
+            "Customer Count": int(r["cq_count"]),
+            "_pq_rev": float(r["pq_rev"]),
+            "_cq_rev": float(r["cq_rev"]),
+            "_growth": growth,
+        })
+        prev_acct = acct
+        prev_tier = tier
 
-    raw_customer_tiers = sorted(df["customer_tier"].dropna().unique().tolist())
-    sel_customer_tiers = st.sidebar.multiselect(
-        "Customer tier", options=raw_customer_tiers, default=raw_customer_tiers
-    )
+    # Grand total — computed directly from quarter slices so it matches KPIs exactly
+    grand_cq = float(cq_df["revenue"].sum())
+    grand_pq = float(pq_df["revenue"].sum()) if not pq_df.empty else 0.0
+    grand_growth = (grand_cq - grand_pq) / grand_pq * 100 if grand_pq > 0 else None
+    rows.append({
+        "Account Type": "Total",
+        "Customer Tier": "",
+        "Spend Tier": "",
+        "Customer Count": int(cq_df["Customer"].nunique()),
+        "_pq_rev": grand_pq,
+        "_cq_rev": grand_cq,
+        "_growth": grand_growth,
+    })
 
-    tier_mask = df["customer_tier"].isin(sel_customer_tiers) | df["customer_tier"].isna()
-    df = df[
-        df["account_type"].isin(sel_account_types)
-        & df["spend_tier"].isin(sel_spend_tiers)
-        & tier_mask
-    ]
+    return pd.DataFrame(rows)
 
-    pq_label = prior_q or "Prior Q"
-    cq_label = current_q
 
+def render_dashboard(df, current_q, prior_q, pq_label, cq_label):
     # ── KPI Dashboard ──────────────────────────────────────────────────────────
     st.subheader(f"KPIs — {current_q}")
     kpis = compute_kpis(df, current_q, prior_q)
@@ -488,16 +529,83 @@ def main():
 
     st.markdown("---")
 
+    # ── Bonus Allocation (inline, right of KPIs) ───────────────────────────────
+    st.subheader("Bonus allocation")
+    st.caption(
+        f"Weighted score: New Accounts {int(WEIGHTS['new_accounts']*100)}% · "
+        f"Low Spend Growth {int(WEIGHTS['low_spend_growth']*100)}% · "
+        f"Reactivated {int(WEIGHTS['reactivated_count']*100)}%"
+    )
+
+    sp_df = compute_sp_summary(df, current_q, prior_q)
+    all_reps = sp_df["Salesperson"].tolist()
+
+    bonus_col1, bonus_col2 = st.columns(2)
+    with bonus_col1:
+        selected_reps = st.multiselect(
+            "Salespeople in bonus pool",
+            options=all_reps,
+            default=all_reps,
+        )
+    with bonus_col2:
+        pool = st.number_input(
+            "Total bonus pool ($)",
+            min_value=0.0,
+            value=2000.0,
+            step=100.0,
+            format="%.2f",
+        )
+
+    if not selected_reps:
+        st.warning("Select at least one salesperson.")
+        return
+
+    alloc_df = compute_bonus_allocation(selected_reps, sp_df, pool)
+
+    a1, a2 = st.columns(2)
+    a1.metric("Reps in pool", len(selected_reps))
+    a2.metric("Total allocated", fmt(alloc_df["bonus"].sum()))
+
+    bonus_display = alloc_df.copy()
+    bonus_display["low_spend_growth"] = bonus_display["low_spend_growth"].apply(fmt)
+    bonus_display["score"] = (bonus_display["score"] * 100).round(1).astype(str) + "%"
+    bonus_display["share"] = (bonus_display["share"] * 100).round(1).astype(str) + "%"
+    bonus_display["bonus"] = bonus_display["bonus"].apply(fmt)
+    st.dataframe(
+        bonus_display.rename(columns={
+            "new_accounts": "New Accounts",
+            "low_spend_growth": "Low Spend Growth",
+            "reactivated_count": "Reactivated",
+            "score": "Weighted Score",
+            "share": "Pool Share",
+            "bonus": "Bonus",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.download_button(
+        "Download allocation as CSV",
+        data=alloc_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"bonus_allocation_{current_q}.csv",
+        mime="text/csv",
+    )
+
+    st.markdown("---")
+
     # ── Salesperson Breakdown ──────────────────────────────────────────────────
     st.subheader("Salesperson breakdown")
 
-    sp_df = compute_sp_summary(df, current_q, prior_q)
-
     sp_display = sp_df[[
-        "Salesperson", "cq_revenue", "growth_pct",
+        "Salesperson", "pq_revenue", "cq_revenue", "growth_pct",
         "attribution_rev", "attribution_pct",
         "new_accounts", "low_spend_growth", "reactivated_count",
     ]].copy()
+
+    sp_total_pq = sp_display["pq_revenue"].sum()
+    sp_total_cq = sp_display["cq_revenue"].sum()
+    sp_total_growth = (sp_total_cq - sp_total_pq) / sp_total_pq * 100 if sp_total_pq > 0 else None
+
+    sp_display["pq_revenue"] = sp_display["pq_revenue"].apply(fmt)
     sp_display["cq_revenue"] = sp_display["cq_revenue"].apply(fmt)
     sp_display["growth_pct"] = sp_display["growth_pct"].apply(
         lambda v: f"{v:+.1f}%" if v is not None else "—"
@@ -508,6 +616,7 @@ def main():
         lambda v: f"+{fmt(v)}" if v >= 0 else f"-${abs(v):,.0f}"
     )
     sp_display = sp_display.rename(columns={
+        "pq_revenue": f"{pq_label} Revenue",
         "cq_revenue": f"{cq_label} Revenue",
         "growth_pct": "Growth",
         "attribution_rev": "Attribution ($)",
@@ -517,17 +626,27 @@ def main():
         "reactivated_count": "Reactivated",
     })
 
+    sp_totals_row = pd.DataFrame([{
+        "Salesperson": f"TOTAL ({len(sp_display)} reps)",
+        f"{pq_label} Revenue": fmt(sp_total_pq),
+        f"{cq_label} Revenue": fmt(sp_total_cq),
+        "Growth": f"{sp_total_growth:+.1f}%" if sp_total_growth is not None else "—",
+        "Attribution ($)": "—",
+        "Attribution (%)": "—",
+        "New Accounts": sp_df["new_accounts"].sum(),
+        "Low Spend Growth": "—",
+        "Reactivated": sp_df["reactivated_count"].sum(),
+    }])
+
     st.dataframe(sp_display, use_container_width=True, hide_index=True)
+    st.dataframe(sp_totals_row, use_container_width=True, hide_index=True)
 
     st.markdown("---")
 
     # ── Customer Detail ────────────────────────────────────────────────────────
     st.subheader("Customer detail")
 
-    # Master salesperson filter — drives all three tables below
-    all_sp_options = sorted(
-        df[df["current_sp"].notna() & ~df["current_sp"].isin(EXCLUDE_SP)]["current_sp"].unique().tolist()
-    )
+    all_sp_options = sorted(df["current_sp"].dropna().unique().tolist())
     selected_detail_sps = st.multiselect(
         "Filter by salesperson",
         options=all_sp_options,
@@ -661,66 +780,123 @@ def main():
         use_container_width=True, hide_index=True,
     )
 
-    st.markdown("---")
 
-    # ── Bonus Allocation ───────────────────────────────────────────────────────
-    st.subheader("Bonus allocation")
-    st.caption(
-        f"Weighted score: New Accounts {int(WEIGHTS['new_accounts']*100)}% · "
-        f"Low Spend Growth {int(WEIGHTS['low_spend_growth']*100)}% · "
-        f"Reactivated {int(WEIGHTS['reactivated_count']*100)}%"
-    )
 
-    all_reps = sp_df["Salesperson"].tolist()
+def main():
+    st.sidebar.header("Data source")
+    uploaded_file = st.sidebar.file_uploader("Upload a CSV file", type=["csv"])
 
-    selected_reps = st.multiselect(
-        "Salespeople in bonus pool",
-        options=all_reps,
-        default=all_reps,
-    )
+    if uploaded_file is not None:
+        source = uploaded_file
+        st.sidebar.success("Using uploaded file")
+    elif DEFAULT_FILE.exists():
+        source = DEFAULT_FILE
+        st.sidebar.info(f"Using local file: {DEFAULT_FILE.name}")
+    else:
+        st.info("Upload a CSV file using the sidebar to get started.")
+        st.stop()
 
-    pool = st.number_input(
-        "Total bonus pool ($)",
-        min_value=0.0,
-        value=200000.0,
-        step=1000.0,
-        format="%.2f",
-    )
-
-    if not selected_reps:
-        st.warning("Select at least one salesperson.")
+    try:
+        with st.spinner("Loading data..."):
+            raw_df = load_csv_data(source)
+    except Exception as e:
+        st.error(f"Failed to read CSV: {e}")
         return
 
-    alloc_df = compute_bonus_allocation(selected_reps, sp_df, pool)
+    try:
+        with st.spinner("Processing..."):
+            df = preprocess_dataset(raw_df)
+    except Exception as e:
+        st.error(f"Failed to process data: {e}")
+        st.write("**Columns found in your CSV:**", list(raw_df.columns))
+        return
 
-    a1, a2 = st.columns(2)
-    a1.metric("Reps in pool", len(selected_reps))
-    a2.metric("Total allocated", fmt(alloc_df["bonus"].sum()))
+    if df["invoice_date"].isna().all():
+        st.error("No valid invoice dates found.")
+        return
 
-    display = alloc_df.copy()
-    display["low_spend_growth"] = display["low_spend_growth"].apply(fmt)
-    display["score"] = (display["score"] * 100).round(1).astype(str) + "%"
-    display["share"] = (display["share"] * 100).round(1).astype(str) + "%"
-    display["bonus"] = display["bonus"].apply(fmt)
-    st.dataframe(
-        display.rename(columns={
-            "new_accounts": "New Accounts",
-            "low_spend_growth": "Low Spend Growth",
-            "reactivated_count": "Reactivated",
-            "score": "Weighted Score",
-            "share": "Pool Share",
-            "bonus": "Bonus",
-        }),
-        use_container_width=True,
-        hide_index=True,
+    quarter_list = sorted(df["quarter"].dropna().unique())
+    current_q = quarter_list[-1]
+    prior_quarters = [q for q in quarter_list if q < current_q]
+    prior_q = prior_quarters[-1] if prior_quarters else None
+
+    # Apply SP grouping: any SP with < $30k in current_q becomes "Other"
+    df, other_sps = apply_sp_grouping(df, current_q)
+
+    # ── Sidebar filters ────────────────────────────────────────────────────────
+    st.sidebar.markdown("---")
+    st.sidebar.header("Filters")
+
+    all_account_types = ["Franchise", "Individual Store"]
+    sel_account_types = st.sidebar.multiselect(
+        "Account type", options=all_account_types, default=all_account_types
     )
 
-    st.download_button(
-        "Download allocation as CSV",
-        data=alloc_df.to_csv(index=False).encode("utf-8"),
-        file_name=f"bonus_allocation_{current_q}.csv",
-        mime="text/csv",
+    all_spend_tiers = ["High Tier", "Medium Tier", "Low Tier"]
+    sel_spend_tiers = st.sidebar.multiselect(
+        "Spend tier", options=all_spend_tiers, default=all_spend_tiers
     )
+
+    raw_customer_tiers = sorted(df["customer_tier"].dropna().unique().tolist())
+    sel_customer_tiers = st.sidebar.multiselect(
+        "Customer tier", options=raw_customer_tiers, default=raw_customer_tiers
+    )
+
+    tier_mask = df["customer_tier"].isin(sel_customer_tiers) | df["customer_tier"].isna()
+    df = df[
+        df["account_type"].isin(sel_account_types)
+        & df["spend_tier"].isin(sel_spend_tiers)
+        & tier_mask
+    ]
+
+    pq_label = prior_q or "Prior Q"
+    cq_label = current_q
+
+    # ── Page tabs ──────────────────────────────────────────────────────────────
+    tab_summary, tab_dash = st.tabs(["Account Summary", "Dashboard"])
+
+    with tab_summary:
+        st.subheader(f"Account Summary — {current_q}")
+        st.caption(f"Revenue comparison: {pq_label} vs {cq_label}. Sidebar filters apply.")
+
+        summary_df = compute_account_summary(df, current_q, prior_q)
+
+        display = summary_df.copy()
+        display[pq_label] = display["_pq_rev"].apply(fmt)
+        display[cq_label] = display["_cq_rev"].apply(fmt)
+        display["Growth"] = display["_growth"].apply(
+            lambda v: f"{v:+.1f}%" if v is not None else "—"
+        )
+        display["Customer Count"] = display["Customer Count"].apply(
+            lambda v: str(v) if v > 0 else "—"
+        )
+        display = display.drop(columns=["_pq_rev", "_cq_rev", "_growth"])
+        st.dataframe(display, use_container_width=True, hide_index=True)
+
+        # Download
+        export = summary_df[["Account Type", "Customer Tier", "Spend Tier", "Customer Count"]].copy()
+        export[pq_label] = summary_df["_pq_rev"]
+        export[cq_label] = summary_df["_cq_rev"]
+        export["Growth %"] = summary_df["_growth"].apply(
+            lambda v: round(v, 1) if v is not None else None
+        )
+        st.download_button(
+            "Download summary as CSV",
+            data=export.to_csv(index=False).encode("utf-8"),
+            file_name=f"account_summary_{current_q}.csv",
+            mime="text/csv",
+        )
+
+        # ── "Other" SP disclosure ──────────────────────────────────────────────
+        st.markdown("---")
+        with st.expander(f"Salespeople grouped as 'Other' ({len(other_sps)}) — under ${OTHER_SP_THRESHOLD:,} in {current_q}"):
+            if other_sps:
+                st.write(", ".join(other_sps))
+            else:
+                st.caption("No salespeople fell below the threshold.")
+
+    with tab_dash:
+        render_dashboard(df, current_q, prior_q, pq_label, cq_label)
 
 
 if __name__ == "__main__":
