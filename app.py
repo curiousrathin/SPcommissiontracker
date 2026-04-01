@@ -107,6 +107,15 @@ def fmt(value: float) -> str:
     return f"${value:,.0f}"
 
 
+def _bold_last_row(df: pd.DataFrame):
+    """Return a Styler with the last row bolded (for total rows)."""
+    last_idx = df.index[-1]
+    def row_style(row):
+        weight = "font-weight: bold" if row.name == last_idx else ""
+        return [weight] * len(row)
+    return df.style.apply(row_style, axis=1)
+
+
 def get_new_accounts_df(df: pd.DataFrame, current_q: str) -> pd.DataFrame:
     """
     Returns a DataFrame of genuinely new accounts in current_q.
@@ -239,6 +248,7 @@ def compute_sp_summary(df: pd.DataFrame, current_q: str, prior_q: str | None) ->
     summary["new_accounts"] = summary["new_accounts"].fillna(0).astype(int)
 
     # Low spend growth: delta for Low Tier customers active in CQ (same universe both quarters)
+    # PQ revenue is attributed to each customer's CQ salesperson so the comparison is consistent.
     cq_low_customers = set(
         cq_df[cq_df["spend_tier"] == "Low Tier"]["Customer"].dropna().unique()
     )
@@ -246,11 +256,24 @@ def compute_sp_summary(df: pd.DataFrame, current_q: str, prior_q: str | None) ->
         cq_df[cq_df["Customer"].isin(cq_low_customers)]
         .groupby("current_sp", observed=True)["revenue"].sum().rename("cq_low_rev")
     )
-    pq_low = (
-        pq_df[pq_df["Customer"].isin(cq_low_customers)]
-        .groupby("current_sp", observed=True)["revenue"].sum().rename("pq_low_rev")
-        if not pq_df.empty else pd.Series(dtype=float, name="pq_low_rev")
-    )
+    if not pq_df.empty:
+        pq_cust_rev = (
+            pq_df[pq_df["Customer"].isin(cq_low_customers)]
+            .groupby("Customer", observed=True)["revenue"].sum().rename("pq_rev")
+        )
+        cq_low_sp = (
+            cq_df[cq_df["Customer"].isin(cq_low_customers)][["Customer", "current_sp"]]
+            .drop_duplicates("Customer")
+            .set_index("Customer")
+        )
+        pq_low = (
+            cq_low_sp.join(pq_cust_rev, how="left")
+            .assign(pq_rev=lambda x: x["pq_rev"].fillna(0.0))
+            .groupby("current_sp", observed=True)["pq_rev"].sum()
+            .rename("pq_low_rev")
+        )
+    else:
+        pq_low = pd.Series(dtype=float, name="pq_low_rev")
     low_tbl = cq_low.to_frame().join(pq_low, how="left").fillna(0.0)
     low_tbl["low_spend_growth"] = low_tbl["cq_low_rev"] - low_tbl["pq_low_rev"]
     summary = summary.join(low_tbl["low_spend_growth"], how="left")
@@ -571,15 +594,25 @@ def render_dashboard(df, current_q, prior_q, pq_label, cq_label):
     bonus_display["score"] = (bonus_display["score"] * 100).round(1).astype(str) + "%"
     bonus_display["share"] = (bonus_display["share"] * 100).round(1).astype(str) + "%"
     bonus_display["bonus"] = bonus_display["bonus"].apply(fmt)
+    bonus_display = bonus_display.rename(columns={
+        "new_accounts": "New Accounts",
+        "low_spend_growth": "Low Spend Growth",
+        "reactivated_count": "Reactivated",
+        "score": "Weighted Score",
+        "share": "Pool Share",
+        "bonus": "Bonus",
+    })
+    bonus_total = pd.DataFrame([{
+        "Salesperson": f"TOTAL ({len(alloc_df)} reps)",
+        "New Accounts": int(alloc_df["new_accounts"].sum()),
+        "Low Spend Growth": fmt(alloc_df["low_spend_growth"].sum()),
+        "Reactivated": int(alloc_df["reactivated_count"].sum()),
+        "Weighted Score": "—",
+        "Pool Share": "100.0%",
+        "Bonus": fmt(alloc_df["bonus"].sum()),
+    }])
     st.dataframe(
-        bonus_display.rename(columns={
-            "new_accounts": "New Accounts",
-            "low_spend_growth": "Low Spend Growth",
-            "reactivated_count": "Reactivated",
-            "score": "Weighted Score",
-            "share": "Pool Share",
-            "bonus": "Bonus",
-        }),
+        _bold_last_row(pd.concat([bonus_display, bonus_total], ignore_index=True)),
         use_container_width=True,
         hide_index=True,
     )
@@ -638,8 +671,10 @@ def render_dashboard(df, current_q, prior_q, pq_label, cq_label):
         "Reactivated": sp_df["reactivated_count"].sum(),
     }])
 
-    st.dataframe(sp_display, use_container_width=True, hide_index=True)
-    st.dataframe(sp_totals_row, use_container_width=True, hide_index=True)
+    st.dataframe(
+        _bold_last_row(pd.concat([sp_display, sp_totals_row], ignore_index=True)),
+        use_container_width=True, hide_index=True,
+    )
 
     st.markdown("---")
 
@@ -679,16 +714,16 @@ def render_dashboard(df, current_q, prior_q, pq_label, cq_label):
         "cq_revenue": f"{cq_label} Revenue",
         "growth_pct": "Growth",
     })
-    st.dataframe(sp_tbl_display, use_container_width=True, hide_index=True)
     sp_growth_str = f"{sp_total_growth:+.1f}%" if sp_total_growth is not None else "—"
+    sp_tbl_total = pd.DataFrame([{
+        "Salesperson": f"TOTAL ({len(sp_tbl_display)} reps)",
+        "2025 Avg/Quarter": "—",
+        f"{pq_label} Revenue": fmt(sp_total_pq),
+        f"{cq_label} Revenue": fmt(sp_total_cq),
+        "Growth": sp_growth_str,
+    }])
     st.dataframe(
-        pd.DataFrame([{
-            "Salesperson": f"TOTAL ({len(sp_tbl_display)} reps)",
-            "2025 Avg/Quarter": "—",
-            f"{pq_label} Revenue": fmt(sp_total_pq),
-            f"{cq_label} Revenue": fmt(sp_total_cq),
-            "Growth": sp_growth_str,
-        }]),
+        _bold_last_row(pd.concat([sp_tbl_display, sp_tbl_total], ignore_index=True)),
         use_container_width=True, hide_index=True,
     )
 
@@ -705,13 +740,13 @@ def render_dashboard(df, current_q, prior_q, pq_label, cq_label):
             "account_type": "Account Type", "customer_tier": "Customer Tier",
             "cq_revenue": f"{cq_label} Revenue",
         })
-        st.dataframe(new_display, use_container_width=True, hide_index=True)
+        new_total = pd.DataFrame([{
+            "Customer": f"TOTAL ({len(new_display)} accounts)",
+            "Salesperson": "—", "Spend Tier": "—", "Account Type": "—", "Customer Tier": "—",
+            f"{cq_label} Revenue": fmt(new_tbl["cq_revenue"].sum()),
+        }])
         st.dataframe(
-            pd.DataFrame([{
-                "Customer": f"TOTAL ({len(new_display)} accounts)",
-                "Salesperson": "—", "Spend Tier": "—", "Account Type": "—", "Customer Tier": "—",
-                f"{cq_label} Revenue": fmt(new_tbl["cq_revenue"].sum()),
-            }]),
+            _bold_last_row(pd.concat([new_display, new_total], ignore_index=True)),
             use_container_width=True, hide_index=True,
         )
 
@@ -729,14 +764,14 @@ def render_dashboard(df, current_q, prior_q, pq_label, cq_label):
             "last_active_q": "Last Active Quarter",
             "cq_revenue": f"{cq_label} Revenue",
         })
-        st.dataframe(react_display, use_container_width=True, hide_index=True)
+        react_total = pd.DataFrame([{
+            "Customer": f"TOTAL ({len(react_display)} accounts)",
+            "Salesperson": "—", "Spend Tier": "—", "Account Type": "—", "Customer Tier": "—",
+            "Last Active Quarter": "—",
+            f"{cq_label} Revenue": fmt(react_tbl["cq_revenue"].sum()),
+        }])
         st.dataframe(
-            pd.DataFrame([{
-                "Customer": f"TOTAL ({len(react_display)} accounts)",
-                "Salesperson": "—", "Spend Tier": "—", "Account Type": "—", "Customer Tier": "—",
-                "Last Active Quarter": "—",
-                f"{cq_label} Revenue": fmt(react_tbl["cq_revenue"].sum()),
-            }]),
+            _bold_last_row(pd.concat([react_display, react_total], ignore_index=True)),
             use_container_width=True, hide_index=True,
         )
 
@@ -766,17 +801,17 @@ def render_dashboard(df, current_q, prior_q, pq_label, cq_label):
         "cq_revenue": f"{cq_label} Revenue",
         "growth_pct": "Growth",
     })
-    st.dataframe(cust_display, use_container_width=True, hide_index=True)
     cust_growth_str = f"{total_growth:+.1f}%" if total_growth is not None else "—"
+    cust_total = pd.DataFrame([{
+        "Customer": f"TOTAL ({len(cust_display)} accounts)",
+        "Salesperson": "—", "Spend Tier": "—", "Account Type": "—", "Customer Tier": "—",
+        "2025 Avg/Quarter": "—",
+        f"{pq_label} Revenue": fmt(total_pq),
+        f"{cq_label} Revenue": fmt(total_cq),
+        "Growth": cust_growth_str,
+    }])
     st.dataframe(
-        pd.DataFrame([{
-            "Customer": f"TOTAL ({len(cust_display)} accounts)",
-            "Salesperson": "—", "Spend Tier": "—", "Account Type": "—", "Customer Tier": "—",
-            "2025 Avg/Quarter": "—",
-            f"{pq_label} Revenue": fmt(total_pq),
-            f"{cq_label} Revenue": fmt(total_cq),
-            "Growth": cust_growth_str,
-        }]),
+        _bold_last_row(pd.concat([cust_display, cust_total], ignore_index=True)),
         use_container_width=True, hide_index=True,
     )
 
@@ -871,7 +906,7 @@ def main():
             lambda v: str(v) if v > 0 else "—"
         )
         display = display.drop(columns=["_pq_rev", "_cq_rev", "_growth"])
-        st.dataframe(display, use_container_width=True, hide_index=True)
+        st.dataframe(_bold_last_row(display), use_container_width=True, hide_index=True)
 
         # Download
         export = summary_df[["Account Type", "Customer Tier", "Spend Tier", "Customer Count"]].copy()
