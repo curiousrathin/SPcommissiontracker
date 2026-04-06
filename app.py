@@ -304,6 +304,82 @@ def render_data_lab(df: pd.DataFrame, current_q: str, prior_q: str | None, pq_la
         use_container_width=True, hide_index=True,
     )
 
+    # ── Low spend growth breakdown ────────────────────────────────────────────
+    st.markdown("**Low spend growth** *(click to expand)*")
+    low_df = filtered[filtered["spend_tier"] == "Low Tier"]
+    for acct_type in ["Franchise", "Individual Store"]:
+        acct_low = low_df[low_df["account_type"] == acct_type]
+        if acct_low.empty:
+            continue
+        total_growth = float((acct_low["cq_revenue"] - acct_low["pq_revenue"]).sum())
+        n = acct_low["Customer"].nunique()
+        growth_str = f"+{fmt(total_growth)}" if total_growth >= 0 else f"-${abs(total_growth):,.0f}"
+        header = f"{acct_type}  —  {growth_str}  |  {n} stores"
+
+        with st.expander(header):
+            if acct_type == "Franchise":
+                # Level 1 — franchise group
+                fg_order = (
+                    acct_low.groupby("franchise", observed=True)
+                    .apply(lambda g: (g["cq_revenue"] - g["pq_revenue"]).sum(), include_groups=False)
+                    .sort_values(ascending=False).index.tolist()
+                )
+                for fg_val in fg_order:
+                    fg_data = acct_low[acct_low["franchise"] == fg_val]
+                    fg_label = fg_val if fg_val else "Unassigned"
+                    fg_growth = float((fg_data["cq_revenue"] - fg_data["pq_revenue"]).sum())
+                    fg_growth_str = f"+{fmt(fg_growth)}" if fg_growth >= 0 else f"-${abs(fg_growth):,.0f}"
+                    fg_n = fg_data["Customer"].nunique()
+
+                    with st.expander(f"{fg_label}  —  {fg_growth_str}  |  {fg_n} stores"):
+                        # Level 2 — individual customers
+                        cust = fg_data[["Customer", "avg_2025_q", "pq_revenue", "cq_revenue", "growth_pct"]].copy()
+                        cust = cust.sort_values("cq_revenue", ascending=False)
+                        cust["2025 Avg/Q"] = cust["avg_2025_q"].apply(fmt)
+                        cust[cq_label] = cust["cq_revenue"].apply(fmt)
+                        cust[pq_label] = cust["pq_revenue"].apply(fmt)
+                        cust["Growth"] = cust["growth_pct"].apply(lambda v: f"{v:+.1f}%" if v is not None else "—")
+                        cust["Low Spend Δ"] = (fg_data["cq_revenue"] - fg_data["pq_revenue"]).apply(
+                            lambda v: f"+{fmt(v)}" if v >= 0 else f"-${abs(v):,.0f}"
+                        )
+                        cust_total = pd.DataFrame([{
+                            "Customer": f"TOTAL ({fg_n} stores)",
+                            "2025 Avg/Q": "—",
+                            pq_label: fmt(fg_data["pq_revenue"].sum()),
+                            cq_label: fmt(fg_data["cq_revenue"].sum()),
+                            "Growth": "—",
+                            "Low Spend Δ": fg_growth_str,
+                        }])
+                        display_cols = ["Customer", "2025 Avg/Q", pq_label, cq_label, "Growth", "Low Spend Δ"]
+                        st.dataframe(
+                            _bold_last_row(pd.concat([cust[display_cols], cust_total], ignore_index=True)),
+                            use_container_width=True, hide_index=True,
+                        )
+            else:
+                # Individual stores — straight to customer table
+                cust = acct_low[["Customer", "avg_2025_q", "pq_revenue", "cq_revenue", "growth_pct"]].copy()
+                cust = cust.sort_values("cq_revenue", ascending=False)
+                cust["2025 Avg/Q"] = cust["avg_2025_q"].apply(fmt)
+                cust[cq_label] = cust["cq_revenue"].apply(fmt)
+                cust[pq_label] = cust["pq_revenue"].apply(fmt)
+                cust["Growth"] = cust["growth_pct"].apply(lambda v: f"{v:+.1f}%" if v is not None else "—")
+                cust["Low Spend Δ"] = (acct_low["cq_revenue"] - acct_low["pq_revenue"]).apply(
+                    lambda v: f"+{fmt(v)}" if v >= 0 else f"-${abs(v):,.0f}"
+                )
+                cust_total = pd.DataFrame([{
+                    "Customer": f"TOTAL ({n} stores)",
+                    "2025 Avg/Q": "—",
+                    pq_label: fmt(acct_low["pq_revenue"].sum()),
+                    cq_label: fmt(acct_low["cq_revenue"].sum()),
+                    "Growth": "—",
+                    "Low Spend Δ": growth_str,
+                }])
+                display_cols = ["Customer", "2025 Avg/Q", pq_label, cq_label, "Growth", "Low Spend Δ"]
+                st.dataframe(
+                    _bold_last_row(pd.concat([cust[display_cols], cust_total], ignore_index=True)),
+                    use_container_width=True, hide_index=True,
+                )
+
     # ── Account type rollup with drill-in ────────────────────────────────────
     st.markdown("**By account type** *(click to expand)*")
     with st.expander("Tier definitions"):
