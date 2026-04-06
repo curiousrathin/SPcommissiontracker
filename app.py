@@ -15,11 +15,13 @@ REQUIRED_COLUMNS = {
     "Current Salesperson", "Salesperson", "Product",
     "Customer Tier", "Account Type",
 }
+OPTIONAL_COLUMNS = {"Franchise"}
 
 
 @st.cache_data(show_spinner=False)
 def load_csv_data(source):
-    raw = pd.read_csv(source, dtype=str, usecols=lambda c: c.strip("\ufeff") in REQUIRED_COLUMNS)
+    all_cols = REQUIRED_COLUMNS | OPTIONAL_COLUMNS
+    raw = pd.read_csv(source, dtype=str, usecols=lambda c: c.strip("\ufeff") in all_cols)
     return raw
 
 
@@ -38,7 +40,12 @@ def preprocess_dataset(df: pd.DataFrame) -> pd.DataFrame:
         "Product": "product",
         "Customer Tier": "customer_tier",
         "Account Type": "account_type",
+        "Franchise": "franchise",
     })
+    if "franchise" not in df.columns:
+        df["franchise"] = ""
+    else:
+        df["franchise"] = df["franchise"].fillna("").str.strip()
 
     df["Customer"] = df["Customer"].str.strip().str.title()
     df["quarter"] = df["invoice_date"].dt.to_period("Q").astype(str)
@@ -71,6 +78,28 @@ def preprocess_dataset(df: pd.DataFrame) -> pd.DataFrame:
     ).rename("spend_tier")
     df = df.join(spend_tier_map, on="Customer")
     df["spend_tier"] = df["spend_tier"].fillna("Low Tier").astype("category")
+
+    # For franchise accounts: override spend tier using the franchise group's
+    # combined 2025 quarterly average across all stores in the same franchise.
+    # One store may hold the PO and distribute internally — the group should be
+    # judged together, not penalised for how the purchase happens to flow.
+    fr_customers = df[df["franchise"] != ""][["Customer", "franchise"]].drop_duplicates()
+    if not fr_customers.empty:
+        cust_to_fr = fr_customers.set_index("Customer")["franchise"]
+        fr_2025 = df_2025[df_2025["Customer"].isin(fr_customers["Customer"])].copy()
+        fr_2025["_franchise"] = fr_2025["Customer"].map(cust_to_fr)
+        fr_agg = fr_2025.groupby("_franchise")["revenue"].sum() / n_2025_q
+        fr_tier = pd.cut(
+            fr_agg,
+            bins=[-np.inf, 5000.0, 10000.0, np.inf],
+            labels=["Low Tier", "Medium Tier", "High Tier"],
+        )
+        # Map franchise-level tier back to each franchise customer row
+        fr_tier_per_cust = cust_to_fr.map(fr_tier)
+        fr_idx = df[df["franchise"] != ""].index
+        df["spend_tier"] = df["spend_tier"].astype(str)
+        df.loc[fr_idx, "spend_tier"] = df.loc[fr_idx, "Customer"].map(fr_tier_per_cust).fillna("Low Tier").values
+        df["spend_tier"] = df["spend_tier"].astype("category")
 
     return df
 
@@ -133,7 +162,7 @@ def build_master_table(df: pd.DataFrame, current_q: str, prior_q: str | None) ->
     ).rename("avg_2025_q")
 
     # Attributes: last invoice in CQ; fall back to PQ for customers inactive in CQ
-    meta_cols = ["current_sp", "spend_tier", "account_type", "customer_tier"]
+    meta_cols = ["current_sp", "spend_tier", "account_type", "customer_tier", "franchise"]
     cq_meta = (
         cq_df.sort_values("invoice_date")
         .groupby("Customer", observed=True)[meta_cols].last()
@@ -275,40 +304,148 @@ def render_data_lab(df: pd.DataFrame, current_q: str, prior_q: str | None, pq_la
         use_container_width=True, hide_index=True,
     )
 
-    # ── Spend tier rollup ─────────────────────────────────────────────────────
-    st.markdown("**By spend tier**")
-    tier_rollup = (
-        filtered.groupby("spend_tier", observed=True)
-        .agg(
-            cq_revenue=("cq_revenue", "sum"),
-            pq_revenue=("pq_revenue", "sum"),
-            customer_count=("Customer", "nunique"),
-        )
-        .reset_index()
-        .rename(columns={"spend_tier": "Spend Tier"})
-    )
-    tier_rollup["growth_pct"] = np.where(
-        tier_rollup["pq_revenue"] > 0,
-        (tier_rollup["cq_revenue"] - tier_rollup["pq_revenue"]) / tier_rollup["pq_revenue"] * 100,
-        None,
-    )
-    tier_display = tier_rollup.copy()
-    tier_display[cq_label] = tier_display["cq_revenue"].apply(fmt)
-    tier_display[pq_label] = tier_display["pq_revenue"].apply(fmt)
-    tier_display["Growth"] = tier_display["growth_pct"].apply(lambda v: f"{v:+.1f}%" if v is not None else "—")
-    tier_display["Customers"] = tier_display["customer_count"].astype(int)
-    tier_display = tier_display[["Spend Tier", pq_label, cq_label, "Growth", "Customers"]]
-    tier_total = pd.DataFrame([{
-        "Spend Tier": f"TOTAL",
-        pq_label: fmt(filtered["pq_revenue"].sum()),
-        cq_label: fmt(filtered["cq_revenue"].sum()),
-        "Growth": f"{total_growth:+.1f}%" if total_growth is not None else "—",
-        "Customers": int(filtered["Customer"].nunique()),
-    }])
-    st.dataframe(
-        _bold_last_row(pd.concat([tier_display, tier_total], ignore_index=True)),
-        use_container_width=True, hide_index=True,
-    )
+    # ── Account type rollup with drill-in ────────────────────────────────────
+    st.markdown("**By account type** *(click to expand)*")
+    with st.expander("Tier definitions"):
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(
+                "**Customer Tier** *(store count per franchise)*\n\n"
+                "| Tier | Stores |\n|---|---|\n"
+                "| Bronze | 2 – 4 |\n"
+                "| Silver | 5 – 9 |\n"
+                "| Gold | 10+ |"
+            )
+        with c2:
+            st.markdown(
+                "**Spend Tier** *(2025 avg quarterly revenue)*\n\n"
+                "| Tier | Revenue |\n|---|---|\n"
+                "| High | > $10,000 |\n"
+                "| Medium | $5,000 – $10,000 |\n"
+                "| Low | < $5,000 |\n\n"
+                "*Franchise accounts are classified by their combined group spend, not per store.*"
+            )
+    for acct_type in ["Franchise", "Individual Store"]:
+        subset = filtered[filtered["account_type"] == acct_type]
+        if subset.empty:
+            continue
+
+        grp_cq = float(subset["cq_revenue"].sum())
+        grp_pq = float(subset["pq_revenue"].sum())
+        grp_growth = (grp_cq - grp_pq) / grp_pq * 100 if grp_pq > 0 else None
+        grp_growth_str = f"{grp_growth:+.1f}%" if grp_growth is not None else "—"
+        n_cust = subset["Customer"].nunique()
+
+        header = f"{acct_type}  —  {fmt(grp_cq)}  |  {grp_growth_str}  |  {n_cust} customers"
+        with st.expander(header):
+            if acct_type == "Franchise":
+                # Level 1 — one expander per customer tier
+                for ct in ["Bronze", "Silver", "Gold", ""]:
+                    ct_data = subset[subset["customer_tier"] == ct]
+                    if ct_data.empty:
+                        continue
+                    ct_label = ct if ct else "Untiered"
+                    ct_cq = float(ct_data["cq_revenue"].sum())
+                    ct_pq = float(ct_data["pq_revenue"].sum())
+                    ct_growth = (ct_cq - ct_pq) / ct_pq * 100 if ct_pq > 0 else None
+                    ct_growth_str = f"{ct_growth:+.1f}%" if ct_growth is not None else "—"
+                    ct_n = ct_data["Customer"].nunique()
+                    ct_header = f"{ct_label}  —  {fmt(ct_cq)}  |  {ct_growth_str}  |  {ct_n} customers"
+
+                    with st.expander(ct_header):
+                        # Level 2 — one expander per spend tier
+                        _tier_sort = {"High Tier": 0, "Medium Tier": 1, "Low Tier": 2}
+                        spend_tiers = sorted(
+                            ct_data["spend_tier"].dropna().unique().tolist(),
+                            key=lambda x: _tier_sort.get(x, 99),
+                        )
+                        for st_val in spend_tiers:
+                            st_data = ct_data[ct_data["spend_tier"] == st_val]
+                            if st_data.empty:
+                                continue
+                            st_cq = float(st_data["cq_revenue"].sum())
+                            st_pq = float(st_data["pq_revenue"].sum())
+                            st_growth = (st_cq - st_pq) / st_pq * 100 if st_pq > 0 else None
+                            st_growth_str = f"{st_growth:+.1f}%" if st_growth is not None else "—"
+                            st_n = st_data["Customer"].nunique()
+                            st_header = f"{st_val}  —  {fmt(st_cq)}  |  {st_growth_str}  |  {st_n} customers"
+
+                            with st.expander(st_header):
+                                # Level 3 — one expander per franchise group
+                                fg_order = (
+                                    st_data.groupby("franchise", observed=True)["cq_revenue"]
+                                    .sum().sort_values(ascending=False).index.tolist()
+                                )
+                                for fg_val in fg_order:
+                                    fg_data = st_data[st_data["franchise"] == fg_val]
+                                    fg_label = fg_val if fg_val else "Unassigned"
+                                    fg_cq = float(fg_data["cq_revenue"].sum())
+                                    fg_pq = float(fg_data["pq_revenue"].sum())
+                                    fg_growth = (fg_cq - fg_pq) / fg_pq * 100 if fg_pq > 0 else None
+                                    fg_growth_str = f"{fg_growth:+.1f}%" if fg_growth is not None else "—"
+                                    fg_n = fg_data["Customer"].nunique()
+                                    fg_header = f"{fg_label}  —  {fmt(fg_cq)}  |  {fg_growth_str}  |  {fg_n} customers"
+
+                                    with st.expander(fg_header):
+                                        # Level 4 — individual customers
+                                        cust = fg_data[["Customer", "avg_2025_q", "pq_revenue", "cq_revenue", "growth_pct"]].copy()
+                                        cust = cust.sort_values("cq_revenue", ascending=False)
+                                        cust["2025 Avg/Q"] = cust["avg_2025_q"].apply(fmt)
+                                        cust[cq_label] = cust["cq_revenue"].apply(fmt)
+                                        cust[pq_label] = cust["pq_revenue"].apply(fmt)
+                                        cust["Growth"] = cust["growth_pct"].apply(lambda v: f"{v:+.1f}%" if v is not None else "—")
+                                        cust_total = pd.DataFrame([{
+                                            "Customer": f"TOTAL ({len(cust)} stores)",
+                                            "2025 Avg/Q": fmt(fg_data["avg_2025_q"].sum()),
+                                            pq_label: fmt(fg_pq),
+                                            cq_label: fmt(fg_cq),
+                                            "Growth": fg_growth_str,
+                                        }])
+                                        display_cols = ["Customer", "2025 Avg/Q", pq_label, cq_label, "Growth"]
+                                        st.dataframe(
+                                            _bold_last_row(pd.concat([cust[display_cols], cust_total], ignore_index=True)),
+                                            use_container_width=True, hide_index=True,
+                                        )
+                # Skip the generic st.dataframe at the bottom for Franchise
+                continue
+            else:
+                # Level 1 — one expander per spend tier
+                _tier_sort = {"High Tier": 0, "Medium Tier": 1, "Low Tier": 2}
+                spend_tiers = sorted(
+                    subset["spend_tier"].dropna().unique().tolist(),
+                    key=lambda x: _tier_sort.get(x, 99),
+                )
+                for st_val in spend_tiers:
+                    st_data = subset[subset["spend_tier"] == st_val]
+                    if st_data.empty:
+                        continue
+                    st_cq = float(st_data["cq_revenue"].sum())
+                    st_pq = float(st_data["pq_revenue"].sum())
+                    st_growth = (st_cq - st_pq) / st_pq * 100 if st_pq > 0 else None
+                    st_growth_str = f"{st_growth:+.1f}%" if st_growth is not None else "—"
+                    st_n = st_data["Customer"].nunique()
+                    st_header = f"{st_val}  —  {fmt(st_cq)}  |  {st_growth_str}  |  {st_n} stores"
+
+                    with st.expander(st_header):
+                        # Level 2 — individual customers
+                        cust = st_data[["Customer", "avg_2025_q", "pq_revenue", "cq_revenue", "growth_pct"]].copy()
+                        cust = cust.sort_values("cq_revenue", ascending=False)
+                        cust["2025 Avg/Q"] = cust["avg_2025_q"].apply(fmt)
+                        cust[cq_label] = cust["cq_revenue"].apply(fmt)
+                        cust[pq_label] = cust["pq_revenue"].apply(fmt)
+                        cust["Growth"] = cust["growth_pct"].apply(lambda v: f"{v:+.1f}%" if v is not None else "—")
+                        cust_total = pd.DataFrame([{
+                            "Customer": f"TOTAL ({st_n} stores)",
+                            "2025 Avg/Q": fmt(st_data["avg_2025_q"].sum()),
+                            pq_label: fmt(st_pq),
+                            cq_label: fmt(st_cq),
+                            "Growth": st_growth_str,
+                        }])
+                        display_cols = ["Customer", "2025 Avg/Q", pq_label, cq_label, "Growth"]
+                        st.dataframe(
+                            _bold_last_row(pd.concat([cust[display_cols], cust_total], ignore_index=True)),
+                            use_container_width=True, hide_index=True,
+                        )
 
     # ── Full customer list ────────────────────────────────────────────────────
     st.markdown("**All customers (raw master table)**")
