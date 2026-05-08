@@ -3,7 +3,10 @@ import pandas as pd
 import streamlit as st
 from pathlib import Path
 
-DEFAULT_FILE = Path("FrankieDS.csv.gz")
+DEFAULT_FILE = next(
+    (p for p in [Path("FrankieDS.csv"), Path("FrankieDS.csv.gz")] if p.exists()),
+    Path("FrankieDS.csv"),
+)
 OTHER_SP_THRESHOLD = 30_000  # SPs with < this in current quarter → grouped as "Other"
 
 st.set_page_config(page_title="Smoke Arsenal Incentive Tool", layout="wide")
@@ -15,7 +18,7 @@ REQUIRED_COLUMNS = {
     "Current Salesperson", "Salesperson", "Product",
     "Customer Tier", "Account Type",
 }
-OPTIONAL_COLUMNS = {"Franchise"}
+OPTIONAL_COLUMNS = {"Franchise", "Delivery Address", "Zip", "Brand"}
 
 
 @st.cache_data(show_spinner=False)
@@ -26,10 +29,10 @@ def load_csv_data(source):
 
 
 @st.cache_data(show_spinner=False)
-def preprocess_dataset(df: pd.DataFrame) -> pd.DataFrame:
+def preprocess_dataset(df: pd.DataFrame, exclude_sa: bool = True) -> pd.DataFrame:
     df = df.copy()
-    # Only exclusion: rows where Customer contains "smoke arsenal" (any casing)
-    df = df[~df["Customer"].str.contains("smoke arsenal", case=False, na=False)]
+    if exclude_sa:
+        df = df[~df["Customer"].str.contains("smoke arsenal", case=False, na=False)]
 
     df["invoice_date"] = pd.to_datetime(df["Invoice Date"], errors="coerce")
     df["revenue"] = pd.to_numeric(df["Untaxed Total"], errors="coerce").fillna(0.0).astype("float32")
@@ -46,6 +49,17 @@ def preprocess_dataset(df: pd.DataFrame) -> pd.DataFrame:
         df["franchise"] = ""
     else:
         df["franchise"] = df["franchise"].fillna("").str.strip()
+
+    for addr_col in ["Delivery Address", "Zip"]:
+        if addr_col not in df.columns:
+            df[addr_col] = ""
+        else:
+            df[addr_col] = df[addr_col].fillna("").str.strip()
+
+    if "Brand" not in df.columns:
+        df["Brand"] = ""
+    else:
+        df["Brand"] = df["Brand"].fillna("").str.strip()
 
     df["Customer"] = df["Customer"].str.strip().str.title()
     df["quarter"] = df["invoice_date"].dt.to_period("Q").astype(str)
@@ -83,7 +97,7 @@ def preprocess_dataset(df: pd.DataFrame) -> pd.DataFrame:
     # combined 2025 quarterly average across all stores in the same franchise.
     # One store may hold the PO and distribute internally — the group should be
     # judged together, not penalised for how the purchase happens to flow.
-    fr_customers = df[df["franchise"] != ""][["Customer", "franchise"]].drop_duplicates()
+    fr_customers = df[df["franchise"] != ""][["Customer", "franchise"]].drop_duplicates(subset="Customer", keep="first")
     if not fr_customers.empty:
         cust_to_fr = fr_customers.set_index("Customer")["franchise"]
         fr_2025 = df_2025[df_2025["Customer"].isin(fr_customers["Customer"])].copy()
@@ -161,33 +175,68 @@ def build_master_table(df: pd.DataFrame, current_q: str, prior_q: str | None) ->
         df_2025.groupby("Customer", observed=True)["revenue"].sum() / n_2025_q
     ).rename("avg_2025_q")
 
-    # Attributes: last invoice in CQ; fall back to PQ for customers inactive in CQ
-    meta_cols = ["current_sp", "spend_tier", "account_type", "customer_tier", "franchise"]
-    cq_meta = (
-        cq_df.sort_values("invoice_date")
-        .groupby("Customer", observed=True)[meta_cols].last()
-        .astype(str)
+    # Yearly revenue totals
+    def _year_rev(year):
+        return (
+            df[df["invoice_date"].dt.year == year]
+            .groupby("Customer", observed=True)["revenue"].sum()
+            .rename(f"sale_{year}")
+        )
+    sale_2024 = _year_rev(2024)
+    sale_2025 = _year_rev(2025)
+    sale_2026 = _year_rev(2026)
+
+    # STLTH-related columns (2025 only)
+    stlth_2025 = (
+        df[
+            (df["invoice_date"].dt.year == 2025) &
+            df["Brand"].str.contains("STLTH", case=False, na=False)
+        ]
+        .groupby("Customer", observed=True)["revenue"].sum()
+        .rename("stlth_2025")
     )
-    if not pq_df.empty:
-        pq_meta = (
-            pq_df.sort_values("invoice_date")
-            .groupby("Customer", observed=True)[meta_cols].last()
+
+    # Attributes: CQ takes priority, then PQ, then most recent invoice ever
+    meta_cols = ["current_sp", "spend_tier", "account_type", "customer_tier", "franchise"]
+    addr_cols = ["Delivery Address", "Zip"]
+    def _last_meta(frame, cols):
+        return (
+            frame.sort_values("invoice_date")
+            .groupby("Customer", observed=True)[cols].last()
             .astype(str)
         )
-        # CQ takes priority; PQ fills in for customers not active in CQ
-        combined_meta = cq_meta.combine_first(pq_meta)
+    cq_meta = _last_meta(cq_df, meta_cols)
+    all_meta = _last_meta(df, meta_cols)
+    if not pq_df.empty:
+        combined_meta = cq_meta.combine_first(_last_meta(pq_df, meta_cols)).combine_first(all_meta)
     else:
-        combined_meta = cq_meta
+        combined_meta = cq_meta.combine_first(all_meta)
 
-    # Outer join: include ALL customers from both quarters
+    # Address fields: most recent invoice ever per customer
+    addr_meta = _last_meta(df, addr_cols)
+
+    # All customers ever seen — base index so no one is dropped
+    all_customers = pd.Index(
+        df["Customer"].dropna().astype(str).unique(), name="Customer"
+    )
     master = (
-        cq_rev.to_frame()
-        .join(pq_rev, how="outer")
+        pd.DataFrame(index=all_customers)
+        .join(cq_rev, how="left")
+        .join(pq_rev, how="left")
         .join(avg_2025, how="left")
+        .join(sale_2024, how="left")
+        .join(sale_2025, how="left")
+        .join(sale_2026, how="left")
+        .join(stlth_2025, how="left")
         .join(combined_meta, how="left")
-        .fillna({"cq_revenue": 0.0, "pq_revenue": 0.0, "avg_2025_q": 0.0})
+        .join(addr_meta, how="left")
+        .fillna({"cq_revenue": 0.0, "pq_revenue": 0.0, "avg_2025_q": 0.0,
+                 "sale_2024": 0.0, "sale_2025": 0.0, "sale_2026": 0.0,
+                 "stlth_2025": 0.0})
         .reset_index()
     )
+    master["sale_2025_ex_stlth"] = master["sale_2025"] - master["stlth_2025"]
+    master["avg_2025_q_ex_stlth"] = master["sale_2025_ex_stlth"] / n_2025_q
 
     master["growth_pct"] = np.where(
         master["pq_revenue"] > 0,
@@ -212,7 +261,7 @@ def build_master_table(df: pd.DataFrame, current_q: str, prior_q: str | None) ->
     return master.sort_values("cq_revenue", ascending=False)
 
 
-def render_data_lab(df: pd.DataFrame, current_q: str, prior_q: str | None, pq_label: str, cq_label: str) -> None:
+def render_data_lab(df: pd.DataFrame, current_q: str, prior_q: str | None, pq_label: str, cq_label: str, key_prefix: str = "lab", show_excluded_col: bool = False) -> None:
     st.subheader("Data Lab — Master Table Verification")
     st.caption(
         "Single source of truth: one row per customer, all facts resolved the same way. "
@@ -220,13 +269,14 @@ def render_data_lab(df: pd.DataFrame, current_q: str, prior_q: str | None, pq_la
     )
 
     master = build_master_table(df, current_q, prior_q)
+    n_2025_q = df[df["quarter"].astype(str).str.startswith("2025")]["quarter"].nunique() or 1
 
     # ── Filters ───────────────────────────────────────────────────────────────
     f1, f2 = st.columns(2)
     sp_options = sorted(master["current_sp"].dropna().unique().tolist())
-    sel_sp = f1.multiselect("Salesperson", options=sp_options, default=sp_options, key="lab_sp")
+    sel_sp = f1.multiselect("Salesperson", options=sp_options, default=sp_options, key=f"{key_prefix}_sp")
     tier_options = ["High Tier", "Medium Tier", "Low Tier"]
-    sel_tiers = f2.multiselect("Spend tier", options=tier_options, default=tier_options, key="lab_tier")
+    sel_tiers = f2.multiselect("Spend tier", options=tier_options, default=tier_options, key=f"{key_prefix}_tier")
 
     filtered = master[
         master["current_sp"].isin(sel_sp) & master["spend_tier"].isin(sel_tiers)
@@ -532,19 +582,52 @@ def render_data_lab(df: pd.DataFrame, current_q: str, prior_q: str | None, pq_la
     cust_display["Growth"] = cust_display["growth_pct"].apply(lambda v: f"{v:+.1f}%" if v is not None else "—")
     cust_display["New"] = cust_display["is_new"].map({True: "Yes", False: ""})
     cust_display["Reactivated"] = cust_display["is_reactivated"].map({True: "Yes", False: ""})
+    cust_display["2024 Sale"] = cust_display["sale_2024"].apply(fmt)
+    cust_display["2025 Sale"] = cust_display["sale_2025"].apply(fmt)
+    cust_display["2026 Sale"] = cust_display["sale_2026"].apply(fmt)
+    cust_display["STLTH Purchase"] = cust_display["stlth_2025"].apply(fmt)
+    cust_display["2025 Sale (ex-STLTH)"] = cust_display["sale_2025_ex_stlth"].apply(fmt)
+    cust_display["2025 Avg/Q (ex-STLTH)"] = cust_display["avg_2025_q_ex_stlth"].apply(fmt)
     cust_display = cust_display.rename(columns={
         "current_sp": "Salesperson", "spend_tier": "Spend Tier",
         "account_type": "Account Type", "customer_tier": "Customer Tier",
+        "franchise": "Franchise",
     })
-    cols = ["Customer", "Salesperson", "Spend Tier", "Account Type", "Customer Tier",
-            "2025 Avg/Q", pq_label, cq_label, "Growth", "New", "Reactivated"]
+    cust_display["Franchise"] = cust_display.apply(
+        lambda r: r["Franchise"] if (r["Customer Tier"] not in ("", "nan", "—") and r["Franchise"] not in ("", "nan")) else "—",
+        axis=1,
+    )
+    for ac in ["Delivery Address", "Zip"]:
+        cust_display[ac] = cust_display[ac].replace("", "—")
+    if show_excluded_col:
+        cust_display["Excluded"] = cust_display["Customer"].str.contains(
+            "smoke arsenal", case=False, na=False
+        ).map({True: "Yes", False: ""})
+    cols = [
+        "Customer",
+        *( ["Excluded"] if show_excluded_col else []),
+        "Salesperson", "Franchise", "Delivery Address", "Zip",
+        "Spend Tier", "Account Type", "Customer Tier",
+        "2025 Avg/Q", pq_label, cq_label, "Growth",
+        "2024 Sale", "2025 Sale", "2026 Sale",
+        "STLTH Purchase", "2025 Sale (ex-STLTH)", "2025 Avg/Q (ex-STLTH)",
+        "New", "Reactivated",
+    ]
     cust_total = pd.DataFrame([{
         "Customer": f"TOTAL ({len(cust_display)} accounts)",
-        "Salesperson": "—", "Spend Tier": "—", "Account Type": "—", "Customer Tier": "—",
+        **( {"Excluded": "—"} if show_excluded_col else {}),
+        "Salesperson": "—", "Franchise": "—", "Delivery Address": "—", "Zip": "—",
+        "Spend Tier": "—", "Account Type": "—", "Customer Tier": "—",
         "2025 Avg/Q": "—",
         pq_label: fmt(filtered["pq_revenue"].sum()),
         cq_label: fmt(filtered["cq_revenue"].sum()),
         "Growth": f"{total_growth:+.1f}%" if total_growth is not None else "—",
+        "2024 Sale": fmt(filtered["sale_2024"].sum()),
+        "2025 Sale": fmt(filtered["sale_2025"].sum()),
+        "2026 Sale": fmt(filtered["sale_2026"].sum()),
+        "STLTH Purchase": fmt(filtered["stlth_2025"].sum()),
+        "2025 Sale (ex-STLTH)": fmt(filtered["sale_2025_ex_stlth"].sum()),
+        "2025 Avg/Q (ex-STLTH)": fmt(filtered["sale_2025_ex_stlth"].sum() / n_2025_q),
         "New": str(int(filtered["is_new"].sum())),
         "Reactivated": str(int(filtered["is_reactivated"].sum())),
     }])
@@ -570,7 +653,7 @@ def render_data_lab(df: pd.DataFrame, current_q: str, prior_q: str | None, pq_la
             "Salespeople in bonus pool",
             options=all_reps,
             default=all_reps,
-            key="lab_bonus_reps",
+            key=f"{key_prefix}_bonus_reps",
         )
     with bonus_col2:
         pool = st.number_input(
@@ -579,7 +662,7 @@ def render_data_lab(df: pd.DataFrame, current_q: str, prior_q: str | None, pq_la
             value=2000.0,
             step=100.0,
             format="%.2f",
-            key="lab_bonus_pool",
+            key=f"{key_prefix}_bonus_pool",
         )
 
     if not selected_reps:
@@ -725,7 +808,8 @@ def main():
 
     try:
         with st.spinner("Processing..."):
-            df = preprocess_dataset(raw_df)
+            df = preprocess_dataset(raw_df, exclude_sa=True)
+            df_full = preprocess_dataset(raw_df, exclude_sa=False)
     except Exception as e:
         st.error(f"Failed to process data: {e}")
         st.write("**Columns found in your CSV:**", list(raw_df.columns))
@@ -735,44 +819,59 @@ def main():
         st.error("No valid invoice dates found.")
         return
 
-    quarter_list = sorted(df["quarter"].dropna().unique())
+    this_q = f"{pd.Period.now('Q').year}Q{pd.Period.now('Q').quarter}"
+    quarter_list = sorted(q for q in df["quarter"].dropna().unique() if q < this_q)
+    if not quarter_list:
+        st.error("No completed quarters found in the dataset.")
+        return
     current_q = quarter_list[-1]
     prior_quarters = [q for q in quarter_list if q < current_q]
     prior_q = prior_quarters[-1] if prior_quarters else None
 
     # Apply SP grouping: any SP with < $30k in current_q becomes "Other"
     df, _ = apply_sp_grouping(df, current_q)
-
-    # ── Sidebar filters ────────────────────────────────────────────────────────
-    st.sidebar.markdown("---")
-    st.sidebar.header("Filters")
-
-    all_account_types = ["Franchise", "Individual Store"]
-    sel_account_types = st.sidebar.multiselect(
-        "Account type", options=all_account_types, default=all_account_types
-    )
-
-    all_spend_tiers = ["High Tier", "Medium Tier", "Low Tier"]
-    sel_spend_tiers = st.sidebar.multiselect(
-        "Spend tier", options=all_spend_tiers, default=all_spend_tiers
-    )
-
-    raw_customer_tiers = sorted(df["customer_tier"].dropna().unique().tolist())
-    sel_customer_tiers = st.sidebar.multiselect(
-        "Customer tier", options=raw_customer_tiers, default=raw_customer_tiers
-    )
-
-    tier_mask = df["customer_tier"].isin(sel_customer_tiers) | df["customer_tier"].isna()
-    df = df[
-        df["account_type"].isin(sel_account_types)
-        & df["spend_tier"].isin(sel_spend_tiers)
-        & tier_mask
-    ]
+    df_full, _ = apply_sp_grouping(df_full, current_q)
 
     pq_label = prior_q or "Prior Q"
     cq_label = current_q
 
-    render_data_lab(df, current_q, prior_q, pq_label, cq_label)
+    tab_lab, tab_full = st.tabs(["Data Lab", "Full Dataset (incl. excluded customers)"])
+
+    with tab_lab:
+        # ── Sidebar filters ────────────────────────────────────────────────────
+        st.sidebar.markdown("---")
+        st.sidebar.header("Filters")
+
+        all_account_types = ["Franchise", "Individual Store"]
+        sel_account_types = st.sidebar.multiselect(
+            "Account type", options=all_account_types, default=all_account_types
+        )
+
+        all_spend_tiers = ["High Tier", "Medium Tier", "Low Tier"]
+        sel_spend_tiers = st.sidebar.multiselect(
+            "Spend tier", options=all_spend_tiers, default=all_spend_tiers
+        )
+
+        raw_customer_tiers = sorted(df["customer_tier"].dropna().unique().tolist())
+        sel_customer_tiers = st.sidebar.multiselect(
+            "Customer tier", options=raw_customer_tiers, default=raw_customer_tiers
+        )
+
+        tier_mask = df["customer_tier"].isin(sel_customer_tiers) | df["customer_tier"].isna()
+        df_filtered = df[
+            df["account_type"].isin(sel_account_types)
+            & df["spend_tier"].isin(sel_spend_tiers)
+            & tier_mask
+        ]
+
+        render_data_lab(df_filtered, current_q, prior_q, pq_label, cq_label, key_prefix="lab")
+
+    with tab_full:
+        st.caption(
+            "Unfiltered view — includes all customers, including internal Smoke Arsenal rows "
+            "excluded from the Data Lab. Use this to verify the full dataset row counts and totals."
+        )
+        render_data_lab(df_full, current_q, prior_q, pq_label, cq_label, key_prefix="full", show_excluded_col=True)
 
 
 if __name__ == "__main__":

@@ -22,10 +22,11 @@
 2. [Dataset Schema](#2-dataset-schema)
 3. [Metrics Definition](#3-metrics-definition)
 4. [Scoring & Bonus Allocation](#4-scoring--bonus-allocation)
-5. [Streamlit UI — Four Tabs](#5-streamlit-ui--four-tabs)
+5. [Streamlit UI — Current Implementation](#5-streamlit-ui--current-implementation-single-page)
 6. [Configuration & File Structure](#6-configuration--file-structure)
 7. [Build Phases](#7-build-phases)
 8. [Data Caveats](#8-data-caveats)
+9. [Hard-Coded Constraints](#9-hard-coded-constraints-current-implementation)
 
 ---
 
@@ -408,51 +409,32 @@ for rep in eligible_reps:
 
 ---
 
-## 5. Streamlit UI — Four Tabs
+## 5. Streamlit UI — Current Implementation (Single Page)
 
-### Tab 1 — Setup
+> **Note:** The original four-tab plan has been simplified. The app now renders a single **Data Lab** page directly — no tab navigation. The Dashboard and Account Summary tabs were removed in April 2026 to reduce complexity and maintenance surface area.
 
-- File uploader: CSV or Excel. Show row count + date range + quarter list on load.
-- Quarter selector: dropdown of all quarters in dataset, default = most recent.
-- Key product lines: comma-separated text input. **Live preview:** show matching `Product` values from dataset as user types, so they can verify the match catches all SKUs before running.
-- Rep eligibility: multiselect of all valid `current_sp` values (exclusion list pre-filtered). Show all valid reps; user picks who is in the pool.
-- Bonus pool: currency-formatted number input.
-- Metric weights: four sliders with running sum shown. Must equal 100%. Include a lock button.
-- Attribution threshold: slider 0–100%, default 50%.
-- Min score threshold: number input, default 0.10.
-- **"Run Analysis" button** — use `@st.cache_data` keyed on file hash + config hash so re-runs are fast.
+### Sidebar
 
-### Tab 2 — Company Overview
+- File uploader (CSV/CSV.gz). Falls back to `FrankieDS.csv.gz` in working directory if present.
+- Filters: Account Type (Franchise / Individual Store), Spend Tier (High/Medium/Low), Customer Tier — all multi-selects, all default to "all selected". These pre-filter the `df` passed to the Data Lab view.
 
-- KPI strip: CQ revenue, PQ revenue, QoQ Δ$ and Δ%, active customers, new customers, reactivations
-- Revenue bar chart: trailing 4 quarters
-- Channel mix: revenue breakdown by `Channel` type (C&G, Hybrid Vape Store, Vape Store, Cannabis Store, etc.)
-- Brand / product line performance table: CQ vs PQ revenue, delta, direction indicator
-- Key line spotlight (if specified): CQ vs PQ for matched products
-- **Company-wide QoQ growth rate — shown prominently as the benchmark reps are compared against**
-- Payment Status volume: shows Reversed invoice count as a data quality indicator
+### Data Lab (main page)
 
-### Tab 3 — Rep Scorecards
+The single source of truth: one row per customer, all facts resolved consistently via `build_master_table`.
 
-Show **all** valid `current_sp` values (after exclusion list filter). Eligible reps highlighted with a coloured badge. Non-eligible reps show the same data but scores are greyed out with label: *"Not included in this period's allocation."*
+- **SP and Spend Tier filters** (within the page, independent of sidebar)
+- **By salesperson rollup** — CQ revenue, PQ revenue, growth %, low spend growth, new accounts, reactivated, customer count; with TOTAL row
+- **By spend tier rollup** — same revenue/growth columns broken down by Low/Medium/High Tier
+- **Full customer list** — all customers with SP, tiers, 2025 avg/Q, CQ/PQ revenue, growth, new/reactivated flags
+- **Bonus allocation** — select reps in pool, enter total pool ($), see weighted score → share → dollar allocation table; download as CSV
 
-Per-rep expandable panel:
-- CQ revenue, PQ revenue, QoQ growth rate, vs company average
-- New customers + reactivations this quarter
-- Growing accounts (with emphasis flags shown) + declining accounts
-- Coverage rate: X of Y eligible accounts ordered this quarter
-- Key product line revenue CQ vs PQ (if key lines specified)
-- **Attribution %:** what % of their accounts' revenue was actually sold by them
-- Accounts excluded from growth credit (attribution < threshold): listed with flag and reason
-- Metric score breakdown: raw value, normalised score (0–1), weight applied, contribution to total score
+### What Was Removed
 
-### Tab 4 — Bonus Allocation
-
-- Allocation table: rep name, each metric (raw + normalised + weighted), final score, % of pool, dollar amount
-- Total allocated — must equal pool exactly after rounding correction
-- Reps below min threshold: listed separately with their score and the threshold they missed
-- **Download Excel:** summary sheet + one sheet per rep with full metric detail
-- **Download PDF:** clean one-page allocation summary for management sign-off
+| Removed | Reason |
+|---|---|
+| Dashboard tab | KPI metrics, SP breakdown, and customer detail tables duplicated what Data Lab already shows |
+| Account Summary tab | Management summary by Account Type × Customer Tier × Spend Tier — removed to simplify |
+| Key product line metrics (BC10K, GH20K, Nuud 50K) | Were in Dashboard only; removed with it |
 
 ---
 
@@ -572,6 +554,113 @@ smoke_arsenal_incentive/
 | **Null Salesperson rows** | 1,827 rows (2.9%). Include in company totals. Exclude from rep scoring. | Attribution calculation divides by zero or assigns revenue to `None` |
 | **Negative revenue** | Returns/credits are negative values. Never clip to zero. | Under-counts rep liability for returns; distorts growth metrics |
 | **Product vs MProduct** | Use `Product` field (not `MProduct`) for key line matching. `Product` is the clean aggregated name; `MProduct` is the raw SKU variant. | Key line matching misses bundled SKUs |
+
+---
+
+## 9. Hard-Coded Constraints (Current Implementation)
+
+These are values baked directly into `app.py` — not configurable from the UI. Any changes require a code edit.
+
+---
+
+### 9.1 Customer Row Exclusion
+**Location:** `preprocess_dataset()` — runs before any analysis.
+
+```python
+df = df[~df["Customer"].str.contains("smoke arsenal", case=False, na=False)]
+```
+Drops all rows where the Customer name contains "smoke arsenal" (any casing). This removes internal Smoke Arsenal entities from revenue totals.
+
+---
+
+### 9.2 Spend Tier Thresholds
+**Location:** `preprocess_dataset()`
+
+| Tier | Rule |
+|---|---|
+| Low Tier | 2025 avg quarterly revenue < $5,000 |
+| Medium Tier | $5,000 – $10,000 |
+| High Tier | > $10,000 |
+
+```python
+bins=[-np.inf, 5000.0, 10000.0, np.inf]
+labels=["Low Tier", "Medium Tier", "High Tier"]
+```
+
+Tiers are assigned from **2025 quarters only** — not the full dataset. If a customer has no 2025 history, they default to Low Tier.
+
+> **Note:** The original plan used $20,000 as the High/Medium boundary. The current implementation uses $10,000.
+
+---
+
+### 9.3 Salesperson Grouping Threshold
+**Location:** `apply_sp_grouping()` — runs after preprocessing, before sidebar filters.
+
+```python
+OTHER_SP_THRESHOLD = 30_000
+```
+
+Any SP with less than $30,000 in total revenue in the **current quarter** is relabelled as `"Other"` across all their rows. This affects every downstream table and rollup.
+
+---
+
+### 9.4 Account Type Normalisation
+**Location:** `preprocess_dataset()`
+
+```python
+account_type = "Franchise" if value == "Franchise" else "Individual Store"
+```
+
+Only two values are recognised. Anything that isn't exactly `"Franchise"` (including nulls) becomes `"Individual Store"`.
+
+---
+
+### 9.5 New Account Qualification Rule
+**Location:** `get_new_accounts_df()`
+
+A customer counts as a **new account** only when both conditions hold:
+1. Their very first invoice in the entire dataset falls in the current quarter.
+2. The `current_sp` on that first invoice **exactly matches** the `Salesperson` column on that invoice.
+
+If the SP fields diverge on the first invoice, the customer is not credited as a new account for anyone.
+
+---
+
+### 9.6 Bonus Allocation Weights
+**Location:** `WEIGHTS` constant in `app.py`
+
+```python
+WEIGHTS = {"new_accounts": 0.4, "low_spend_growth": 0.3, "reactivated_count": 0.3}
+```
+
+| Factor | Weight |
+|---|---|
+| New accounts | 40% |
+| Low spend growth (Low Tier CQ vs PQ delta) | 30% |
+| Reactivated accounts | 30% |
+
+These are fixed. The bonus pool dollar amount is entered by the user at runtime; the weights are not adjustable in the UI.
+
+---
+
+### 9.7 2025 Baseline Hardcoding
+Two separate places anchor calculations to 2025 specifically:
+- **Spend tier assignment** (`preprocess_dataset()`): `df[df["quarter"].str.startswith("2025")]`
+- **2025 avg/quarter column** (`build_master_table()`): same filter
+
+When 2026 becomes the historical baseline, these will need updating to either include 2026 or switch to a rolling N-quarter average.
+
+---
+
+### 9.8 Quarter Auto-Detection
+**Location:** `main()`
+
+```python
+current_q = quarter_list[-1]   # latest quarter in the data
+prior_q = quarter_list[-2]     # one before that
+```
+
+There is no UI override — the app always analyses the most recent quarter in the dataset vs the one immediately before it.
 
 ---
 
