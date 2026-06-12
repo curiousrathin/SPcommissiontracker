@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from pathlib import Path
+from typing import Optional
 
 DEFAULT_FILE = next(
     (p for p in [Path("FrankieDS.csv"), Path("FrankieDS.csv.gz")] if p.exists()),
@@ -147,8 +148,18 @@ def fmt(value: float) -> str:
     return f"${value:,.0f}"
 
 
+def fmt_quarter(q: str) -> str:
+    if not q or q in ("", "—", "nan"):
+        return "—"
+    try:
+        year, qnum = q.split("Q")
+        return f"Q{qnum} {year}"
+    except Exception:
+        return q
+
+
 @st.cache_data(show_spinner=False)
-def build_master_table(df: pd.DataFrame, current_q: str, prior_q: str | None) -> pd.DataFrame:
+def build_master_table(df: pd.DataFrame, current_q: str, prior_q: Optional[str]) -> pd.DataFrame:
     """
     One row per customer active in current_q. All facts resolved from the same
     source so every downstream table can be derived consistently.
@@ -249,19 +260,54 @@ def build_master_table(df: pd.DataFrame, current_q: str, prior_q: str | None) ->
     new_acct_customers = set(get_new_accounts_df(df, current_q)["Customer"].unique())
     master["is_new"] = master["Customer"].isin(new_acct_customers)
 
-    # Reactivated: not in PQ, but seen before PQ
+    # Reactivated: not in PQ, seen before PQ, AND placed >= 2 orders or ordered in >= 2 months in CQ
     pq_customers = set(pq_df["Customer"].dropna().unique()) if not pq_df.empty else set()
     pre_pq_q = prior_q if prior_q else current_q
     pre_pq_customers = set(df[df["quarter"] < pre_pq_q]["Customer"].dropna().unique())
+    cq_activity = cq_df.groupby("Customer", observed=True).agg(
+        _order_count=("invoice_date", "count"),
+        _month_count=("invoice_date", lambda x: x.dt.month.nunique()),
+    )
+    cq_min_activity = set(
+        cq_activity[
+            (cq_activity["_order_count"] >= 2) | (cq_activity["_month_count"] >= 2)
+        ].index.tolist()
+    )
     master["is_reactivated"] = (
         ~master["Customer"].isin(pq_customers)
         & master["Customer"].isin(pre_pq_customers)
+        & master["Customer"].isin(cq_min_activity)
     )
+
+    # Last quarter with purchases, populated only for reactivated accounts
+    last_q_per_cust = (
+        df[df["quarter"] < current_q]
+        .groupby("Customer", observed=True)["quarter"]
+        .max()
+    )
+    master["last_purchase_quarter"] = (
+        master["Customer"].map(last_q_per_cust)
+        .where(master["is_reactivated"], other="")
+        .fillna("")
+    )
+
+    # Growth amount = CQ revenue − 2025 avg/Q ex-STLTH, floored at 0 (shrunken accounts earn nothing)
+    master["growth_amount"] = (master["cq_revenue"] - master["avg_2025_q_ex_stlth"]).clip(lower=0)
+    master.loc[master["cq_revenue"] == 0, "growth_amount"] = 0.0
+
+    # Growth commission: Low Tier 2%, Medium/High Tier 1%
+    _rate_map = {"Low Tier": 0.02, "Medium Tier": 0.01, "High Tier": 0.01}
+    _rates = master["spend_tier"].astype(str).map(_rate_map).fillna(0.01)
+    master["growth_commission"] = (master["growth_amount"] * _rates).round(2)
+
+    # Flat incentives
+    master["new_incentive"] = np.where(master["is_new"], 50.0, 0.0)
+    master["reactivated_incentive"] = np.where(master["is_reactivated"], 100.0, 0.0)
 
     return master.sort_values("cq_revenue", ascending=False)
 
 
-def render_data_lab(df: pd.DataFrame, current_q: str, prior_q: str | None, pq_label: str, cq_label: str, key_prefix: str = "lab", show_excluded_col: bool = False) -> None:
+def render_data_lab(df: pd.DataFrame, current_q: str, prior_q: Optional[str], pq_label: str, cq_label: str, key_prefix: str = "lab", show_excluded_col: bool = False) -> None:
     st.subheader("Data Lab — Master Table Verification")
     st.caption(
         "Single source of truth: one row per customer, all facts resolved the same way. "
@@ -581,13 +627,18 @@ def render_data_lab(df: pd.DataFrame, current_q: str, prior_q: str | None, pq_la
     cust_display["2025 Avg/Q"] = cust_display["avg_2025_q"].apply(fmt)
     cust_display["Growth"] = cust_display["growth_pct"].apply(lambda v: f"{v:+.1f}%" if v is not None else "—")
     cust_display["New"] = cust_display["is_new"].map({True: "Yes", False: ""})
+    cust_display["New Incentive"] = cust_display["new_incentive"].apply(lambda v: fmt(v) if v > 0 else "—")
     cust_display["Reactivated"] = cust_display["is_reactivated"].map({True: "Yes", False: ""})
+    cust_display["Last Purchase Q"] = cust_display["last_purchase_quarter"].apply(fmt_quarter)
+    cust_display["Reactivated Incentive"] = cust_display["reactivated_incentive"].apply(lambda v: fmt(v) if v > 0 else "—")
     cust_display["2024 Sale"] = cust_display["sale_2024"].apply(fmt)
     cust_display["2025 Sale"] = cust_display["sale_2025"].apply(fmt)
     cust_display["2026 Sale"] = cust_display["sale_2026"].apply(fmt)
     cust_display["STLTH Purchase"] = cust_display["stlth_2025"].apply(fmt)
     cust_display["2025 Sale (ex-STLTH)"] = cust_display["sale_2025_ex_stlth"].apply(fmt)
     cust_display["2025 Avg/Q (ex-STLTH)"] = cust_display["avg_2025_q_ex_stlth"].apply(fmt)
+    cust_display["Growth Amount"] = cust_display["growth_amount"].apply(lambda v: fmt(v) if v > 0 else "—")
+    cust_display["Growth Commission"] = cust_display["growth_commission"].apply(lambda v: fmt(v) if v > 0 else "—")
     cust_display = cust_display.rename(columns={
         "current_sp": "Salesperson", "spend_tier": "Spend Tier",
         "account_type": "Account Type", "customer_tier": "Customer Tier",
@@ -611,7 +662,8 @@ def render_data_lab(df: pd.DataFrame, current_q: str, prior_q: str | None, pq_la
         "2025 Avg/Q", pq_label, cq_label, "Growth",
         "2024 Sale", "2025 Sale", "2026 Sale",
         "STLTH Purchase", "2025 Sale (ex-STLTH)", "2025 Avg/Q (ex-STLTH)",
-        "New", "Reactivated",
+        "Growth Amount", "Growth Commission",
+        "New", "New Incentive", "Reactivated", "Last Purchase Q", "Reactivated Incentive",
     ]
     cust_total = pd.DataFrame([{
         "Customer": f"TOTAL ({len(cust_display)} accounts)",
@@ -628,8 +680,13 @@ def render_data_lab(df: pd.DataFrame, current_q: str, prior_q: str | None, pq_la
         "STLTH Purchase": fmt(filtered["stlth_2025"].sum()),
         "2025 Sale (ex-STLTH)": fmt(filtered["sale_2025_ex_stlth"].sum()),
         "2025 Avg/Q (ex-STLTH)": fmt(filtered["sale_2025_ex_stlth"].sum() / n_2025_q),
+        "Growth Amount": fmt(filtered["growth_amount"].sum()),
+        "Growth Commission": fmt(filtered["growth_commission"].sum()),
         "New": str(int(filtered["is_new"].sum())),
+        "New Incentive": fmt(filtered["new_incentive"].sum()),
         "Reactivated": str(int(filtered["is_reactivated"].sum())),
+        "Last Purchase Q": "—",
+        "Reactivated Incentive": fmt(filtered["reactivated_incentive"].sum()),
     }])
     st.dataframe(
         _bold_last_row(pd.concat([cust_display[cols], cust_total], ignore_index=True)),
