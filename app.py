@@ -171,11 +171,11 @@ def fmt_quarter(q: str) -> str:
         return q
 
 
-def _bold_last_row(df: pd.DataFrame):
-    """Return a Styler with the last row bolded (for total rows)."""
-    last_idx = df.index[-1]
+def _bold_first_row(df: pd.DataFrame):
+    """Return a Styler with the first row bolded (total pinned at top)."""
+    first_idx = df.index[0]
     def row_style(row):
-        weight = "font-weight: bold" if row.name == last_idx else ""
+        weight = "font-weight: bold" if row.name == first_idx else ""
         return [weight] * len(row)
     return df.style.apply(row_style, axis=1)
 
@@ -475,7 +475,36 @@ def render_summary(df: pd.DataFrame, current_q: str, prior_q: Optional[str], pq_
         "Total Commission": fmt(sp_table["total_commission"].sum()),
     }])
     st.dataframe(
-        _bold_last_row(pd.concat([sp_display, sp_total_row], ignore_index=True)),
+        _bold_first_row(pd.concat([sp_total_row, sp_display], ignore_index=True)),
+        use_container_width=True, hide_index=True,
+    )
+
+    # ── Growth source breakdown — two rows only: Franchises vs Individual Stores ──
+    st.markdown("**Growth source breakdown**")
+    fr_grp = grp[grp["is_franchise"]]
+    ind_grp = grp[~grp["is_franchise"]]
+    breakdown_rows = pd.DataFrame([
+        {
+            "Source": "Franchises",
+            "Revenue": fmt(fr_grp["cq_revenue"].sum()),
+            "Growth Amount": fmt(fr_grp["growth_amount"].sum()) if fr_grp["growth_amount"].sum() > 0 else "—",
+            "Growth Commission": fmt(fr_grp["growth_commission"].sum()) if fr_grp["growth_commission"].sum() > 0 else "—",
+        },
+        {
+            "Source": "Individual Stores",
+            "Revenue": fmt(ind_grp["cq_revenue"].sum()),
+            "Growth Amount": fmt(ind_grp["growth_amount"].sum()) if ind_grp["growth_amount"].sum() > 0 else "—",
+            "Growth Commission": fmt(ind_grp["growth_commission"].sum()) if ind_grp["growth_commission"].sum() > 0 else "—",
+        },
+    ])
+    breakdown_total = pd.DataFrame([{
+        "Source": "TOTAL",
+        "Revenue": fmt(grp["cq_revenue"].sum()),
+        "Growth Amount": fmt(grp["growth_amount"].sum()) if grp["growth_amount"].sum() > 0 else "—",
+        "Growth Commission": fmt(grp["growth_commission"].sum()) if grp["growth_commission"].sum() > 0 else "—",
+    }])
+    st.dataframe(
+        _bold_first_row(pd.concat([breakdown_total, breakdown_rows], ignore_index=True)),
         use_container_width=True, hide_index=True,
     )
 
@@ -494,78 +523,138 @@ def render_summary(df: pd.DataFrame, current_q: str, prior_q: Optional[str], pq_
     st.markdown("---")
 
     # ── By customer / franchise ──────────────────────────────────────────────
-    st.markdown("**By customer / franchise** *(click a franchise to drill in)*")
+    # One unified table: franchise groups appear as a single aggregated row each;
+    # individual stores appear as their own row. The TOTAL row matches the KPI above.
+    # Franchise drill-down expanders appear below for store-level detail.
+    st.markdown("**By customer / franchise**")
+    st.caption("Franchise groups are shown as a single row (aggregated). Expand a franchise below to see its individual stores.")
 
-    fr_totals = (
-        grp[grp["is_franchise"]]
-        .groupby("group_key", observed=True)
-        .agg(
-            cq_revenue=("cq_revenue", "sum"),
-            growth_amount=("growth_amount", "sum"),
-            growth_commission=("growth_commission", "sum"),
-        )
-        .sort_values("cq_revenue", ascending=False)
-    )
-    for fr_name, fr_row in fr_totals.iterrows():
-        fr_stores = filtered[filtered["franchise"] == fr_name].sort_values("cq_revenue", ascending=False)
-        n_stores = len(fr_stores)
-        header = (
-            f"{fr_name}  —  {fmt(fr_row['cq_revenue'])}  |  "
-            f"Growth {fmt(fr_row['growth_amount'])}  |  Commission {fmt(fr_row['growth_commission'])}  |  {n_stores} stores"
-        )
-        with st.expander(header):
-            store_display = fr_stores[[
-                "Customer", "current_sp", "cq_revenue", "pq_revenue",
-                "avg_2025_q", "avg_2025_q_ex_stlth", "is_new", "is_reactivated",
-            ]].copy()
-            store_display[cq_label] = store_display["cq_revenue"].apply(fmt)
-            store_display[pq_label] = store_display["pq_revenue"].apply(fmt)
-            store_display["2025 Avg/Q"] = store_display["avg_2025_q"].apply(fmt)
-            store_display["2025 Avg/Q (ex-STLTH)"] = store_display["avg_2025_q_ex_stlth"].apply(fmt)
-            store_display["New"] = store_display["is_new"].map({True: "Yes", False: ""})
-            store_display["Reactivated"] = store_display["is_reactivated"].map({True: "Yes", False: ""})
-            store_display = store_display.rename(columns={"current_sp": "Salesperson"})
-            cols = [
-                "Customer", "Salesperson", pq_label, cq_label,
-                "2025 Avg/Q", "2025 Avg/Q (ex-STLTH)", "New", "Reactivated",
-            ]
-            st.dataframe(store_display[cols], use_container_width=True, hide_index=True)
+    fr_in_filtered = filtered[filtered["franchise"] != ""]
+    individual = filtered[filtered["franchise"] == ""]
 
-    individual = filtered[filtered["franchise"] == ""].sort_values("cq_revenue", ascending=False)
+    # Franchise summary rows: revenue/avg aggregated from master; growth from grp (group-level floor)
+    if not fr_in_filtered.empty:
+        fr_rev = (
+            fr_in_filtered.groupby("franchise", observed=True)
+            .agg(
+                cq_revenue=("cq_revenue", "sum"),
+                pq_revenue=("pq_revenue", "sum"),
+                avg_2025_q=("avg_2025_q", "sum"),
+                avg_2025_q_ex_stlth=("avg_2025_q_ex_stlth", "sum"),
+                spend_tier=("spend_tier", "first"),
+                is_new=("is_new", "sum"),
+                is_reactivated=("is_reactivated", "sum"),
+            )
+            .reset_index()
+            .rename(columns={"franchise": "_name"})
+        )
+        fr_growth = (
+            grp[grp["is_franchise"]]
+            .groupby("group_key", observed=True)
+            .agg(growth_amount=("growth_amount", "sum"), growth_commission=("growth_commission", "sum"))
+            .reset_index()
+            .rename(columns={"group_key": "_name"})
+        )
+        fr_rows = fr_rev.merge(fr_growth, on="_name", how="left").fillna(0.0)
+        fr_rows["_type"] = "Franchise"
+        fr_rows["current_sp"] = "—"
+    else:
+        fr_rows = pd.DataFrame()
+
+    # Individual store rows: values taken directly from master
     if not individual.empty:
-        st.markdown("**Individual stores**")
-        ind_display = individual.copy()
-        ind_display[cq_label] = ind_display["cq_revenue"].apply(fmt)
-        ind_display[pq_label] = ind_display["pq_revenue"].apply(fmt)
-        ind_display["2025 Avg/Q"] = ind_display["avg_2025_q"].apply(fmt)
-        ind_display["2025 Avg/Q (ex-STLTH)"] = ind_display["avg_2025_q_ex_stlth"].apply(fmt)
-        ind_display["Growth Amount"] = ind_display["growth_amount"].apply(lambda v: fmt(v) if v > 0 else "—")
-        ind_display["Growth Commission"] = ind_display["growth_commission"].apply(lambda v: fmt(v) if v > 0 else "—")
-        ind_display["New"] = ind_display["is_new"].map({True: "Yes", False: ""})
-        ind_display["Reactivated"] = ind_display["is_reactivated"].map({True: "Yes", False: ""})
-        ind_display["Spend Tier"] = ind_display["spend_tier"]
-        ind_display = ind_display.rename(columns={"current_sp": "Salesperson"})
-        cols = [
-            "Customer", "Salesperson", "Spend Tier", pq_label, cq_label,
-            "2025 Avg/Q", "2025 Avg/Q (ex-STLTH)", "Growth Amount", "Growth Commission",
-            "New", "Reactivated",
-        ]
-        ind_total = pd.DataFrame([{
-            "Customer": f"TOTAL ({len(individual)} stores)",
-            "Salesperson": "—", "Spend Tier": "—",
-            pq_label: fmt(individual["pq_revenue"].sum()),
-            cq_label: fmt(individual["cq_revenue"].sum()),
-            "2025 Avg/Q": fmt(individual["avg_2025_q"].sum()),
-            "2025 Avg/Q (ex-STLTH)": fmt(individual["avg_2025_q_ex_stlth"].sum()),
-            "Growth Amount": fmt(individual["growth_amount"].sum()),
-            "Growth Commission": fmt(individual["growth_commission"].sum()),
-            "New": str(int(individual["is_new"].sum())),
-            "Reactivated": str(int(individual["is_reactivated"].sum())),
-        }])
-        st.dataframe(
-            _bold_last_row(pd.concat([ind_display[cols], ind_total], ignore_index=True)),
-            use_container_width=True, hide_index=True,
-        )
+        ind_rows = individual[[
+            "Customer", "current_sp", "spend_tier", "cq_revenue", "pq_revenue",
+            "avg_2025_q", "avg_2025_q_ex_stlth",
+            "growth_amount", "growth_commission", "is_new", "is_reactivated",
+        ]].copy()
+        ind_rows = ind_rows.rename(columns={"Customer": "_name"})
+        ind_rows["_type"] = "Individual"
+    else:
+        ind_rows = pd.DataFrame()
+
+    common_cols = [
+        "_name", "_type", "current_sp", "spend_tier",
+        "cq_revenue", "pq_revenue", "avg_2025_q", "avg_2025_q_ex_stlth",
+        "growth_amount", "growth_commission", "is_new", "is_reactivated",
+    ]
+    parts = [df_part[common_cols] for df_part in [fr_rows, ind_rows] if not df_part.empty]
+    unified = pd.concat(parts, ignore_index=True).sort_values("cq_revenue", ascending=False)
+
+    unified_disp = pd.DataFrame({
+        "Customer / Group": unified["_name"],
+        "Type": unified["_type"],
+        "Salesperson": unified["current_sp"],
+        "Spend Tier": unified["spend_tier"],
+        pq_label: unified["pq_revenue"].apply(fmt),
+        cq_label: unified["cq_revenue"].apply(fmt),
+        "2025 Avg/Q": unified["avg_2025_q"].apply(fmt),
+        "2025 Avg/Q (ex-STLTH)": unified["avg_2025_q_ex_stlth"].apply(fmt),
+        "Growth Amount": unified["growth_amount"].apply(lambda v: fmt(v) if v > 0 else "—"),
+        "Growth Commission": unified["growth_commission"].apply(lambda v: fmt(v) if v > 0 else "—"),
+        "New": unified["is_new"].apply(lambda v: str(int(v)) if v > 0 else ""),
+        "Reactivated": unified["is_reactivated"].apply(lambda v: str(int(v)) if v > 0 else ""),
+    })
+    unified_total = pd.DataFrame([{
+        "Customer / Group": f"TOTAL ({len(unified)} accounts)",
+        "Type": "—", "Salesperson": "—", "Spend Tier": "—",
+        pq_label: fmt(unified["pq_revenue"].sum()),
+        cq_label: fmt(unified["cq_revenue"].sum()),
+        "2025 Avg/Q": fmt(unified["avg_2025_q"].sum()),
+        "2025 Avg/Q (ex-STLTH)": fmt(unified["avg_2025_q_ex_stlth"].sum()),
+        "Growth Amount": fmt(unified["growth_amount"].sum()),
+        "Growth Commission": fmt(unified["growth_commission"].sum()),
+        "New": str(int(unified["is_new"].sum())),
+        "Reactivated": str(int(unified["is_reactivated"].sum())),
+    }])
+    st.dataframe(
+        _bold_first_row(pd.concat([unified_total, unified_disp], ignore_index=True)),
+        use_container_width=True, hide_index=True,
+    )
+
+    # ── Franchise drill-down expanders ───────────────────────────────────────
+    if not fr_rows.empty:
+        st.markdown("**Franchise drill-down** *(click to see store-level detail)*")
+        for _, fr_row in fr_rows.sort_values("cq_revenue", ascending=False).iterrows():
+            fr_name = fr_row["_name"]
+            fr_stores = fr_in_filtered[fr_in_filtered["franchise"] == fr_name].sort_values("cq_revenue", ascending=False)
+            n_stores = len(fr_stores)
+            # Escape $ with \$ and use · instead of | to prevent markdown math/table rendering
+            header = (
+                f"{fr_name}  —  "
+                f"Revenue \\${fr_row['cq_revenue']:,.0f}  ·  "
+                f"Growth \\${fr_row['growth_amount']:,.0f}  ·  "
+                f"Commission \\${fr_row['growth_commission']:,.0f}  ·  "
+                f"{n_stores} store{'s' if n_stores != 1 else ''}"
+            )
+            with st.expander(header):
+                store_disp_cols = ["Customer", "Salesperson", pq_label, cq_label,
+                                   "2025 Avg/Q", "2025 Avg/Q (ex-STLTH)", "New", "Reactivated"]
+                store_display = fr_stores[[
+                    "Customer", "current_sp", "cq_revenue", "pq_revenue",
+                    "avg_2025_q", "avg_2025_q_ex_stlth", "is_new", "is_reactivated",
+                ]].copy()
+                store_display[cq_label] = store_display["cq_revenue"].apply(fmt)
+                store_display[pq_label] = store_display["pq_revenue"].apply(fmt)
+                store_display["2025 Avg/Q"] = store_display["avg_2025_q"].apply(fmt)
+                store_display["2025 Avg/Q (ex-STLTH)"] = store_display["avg_2025_q_ex_stlth"].apply(fmt)
+                store_display["New"] = store_display["is_new"].map({True: "Yes", False: ""})
+                store_display["Reactivated"] = store_display["is_reactivated"].map({True: "Yes", False: ""})
+                store_display = store_display.rename(columns={"current_sp": "Salesperson"})
+                store_total = pd.DataFrame([{
+                    "Customer": f"TOTAL ({n_stores} stores)",
+                    "Salesperson": "—",
+                    pq_label: fmt(fr_stores["pq_revenue"].sum()),
+                    cq_label: fmt(fr_stores["cq_revenue"].sum()),
+                    "2025 Avg/Q": fmt(fr_stores["avg_2025_q"].sum()),
+                    "2025 Avg/Q (ex-STLTH)": fmt(fr_stores["avg_2025_q_ex_stlth"].sum()),
+                    "New": str(int(fr_stores["is_new"].sum())) if fr_stores["is_new"].sum() > 0 else "",
+                    "Reactivated": str(int(fr_stores["is_reactivated"].sum())) if fr_stores["is_reactivated"].sum() > 0 else "",
+                }])
+                st.dataframe(
+                    _bold_first_row(pd.concat([store_total, store_display[store_disp_cols]], ignore_index=True)),
+                    use_container_width=True, hide_index=True,
+                )
 
 
 def render_master_table(df: pd.DataFrame, current_q: str, prior_q: Optional[str], pq_label: str, cq_label: str, key_prefix: str = "lab", show_excluded_col: bool = False) -> None:
@@ -661,7 +750,7 @@ def render_master_table(df: pd.DataFrame, current_q: str, prior_q: Optional[str]
         "Reactivated Incentive": fmt(filtered["reactivated_incentive"].sum()),
     }])
     st.dataframe(
-        _bold_last_row(pd.concat([cust_display[cols], cust_total], ignore_index=True)),
+        _bold_first_row(pd.concat([cust_total, cust_display[cols]], ignore_index=True)),
         use_container_width=True, hide_index=True,
     )
     st.download_button(
