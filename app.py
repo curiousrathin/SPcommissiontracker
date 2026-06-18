@@ -657,7 +657,7 @@ def render_summary(df: pd.DataFrame, current_q: str, prior_q: Optional[str], pq_
                 )
 
 
-def render_master_table(df: pd.DataFrame, current_q: str, prior_q: Optional[str], pq_label: str, cq_label: str, key_prefix: str = "lab", show_excluded_col: bool = False) -> None:
+def render_master_table(df: pd.DataFrame, current_q: str, prior_q: Optional[str], pq_label: str, cq_label: str, key_prefix: str = "master") -> None:
     st.subheader("Master Table")
     st.caption(
         "Single source of truth: one row per customer, all facts resolved the same way. "
@@ -668,15 +668,21 @@ def render_master_table(df: pd.DataFrame, current_q: str, prior_q: Optional[str]
     n_2025_q = df[df["quarter"].astype(str).str.startswith("2025")]["quarter"].nunique() or 1
 
     # ── Filters ───────────────────────────────────────────────────────────────
-    f1, f2 = st.columns(2)
+    f1, f2, f3 = st.columns([3, 3, 2])
     sp_options = sorted(master["current_sp"].dropna().unique().tolist())
     sel_sp = f1.multiselect("Salesperson", options=sp_options, default=sp_options, key=f"{key_prefix}_sp")
     tier_options = ["High Tier", "Medium Tier", "Low Tier"]
     sel_tiers = f2.multiselect("Spend tier", options=tier_options, default=tier_options, key=f"{key_prefix}_tier")
+    show_excluded = f3.checkbox("Include excluded customers", value=True, key=f"{key_prefix}_excl")
+
+    # Mark which rows are excluded (Smoke Arsenal internal accounts)
+    master["_is_excluded"] = master["Customer"].str.contains("smoke arsenal", case=False, na=False)
 
     filtered = master[
         master["current_sp"].isin(sel_sp) & master["spend_tier"].isin(sel_tiers)
     ]
+    if not show_excluded:
+        filtered = filtered[~filtered["_is_excluded"]]
 
     total_cq = filtered["cq_revenue"].sum()
     total_pq = filtered["pq_revenue"].sum()
@@ -711,13 +717,10 @@ def render_master_table(df: pd.DataFrame, current_q: str, prior_q: Optional[str]
     )
     for ac in ["Delivery Address", "Zip"]:
         cust_display[ac] = cust_display[ac].replace("", "—")
-    if show_excluded_col:
-        cust_display["Excluded"] = cust_display["Customer"].str.contains(
-            "smoke arsenal", case=False, na=False
-        ).map({True: "Yes", False: ""})
+    cust_display["Excluded"] = cust_display["_is_excluded"].map({True: "Yes", False: ""})
     cols = [
         "Customer",
-        *( ["Excluded"] if show_excluded_col else []),
+        "Excluded",
         "Salesperson", "Franchise", "Delivery Address", "Zip",
         "Spend Tier", "Account Type", "Customer Tier",
         "2025 Avg/Q", pq_label, cq_label, "Growth",
@@ -728,7 +731,7 @@ def render_master_table(df: pd.DataFrame, current_q: str, prior_q: Optional[str]
     ]
     cust_total = pd.DataFrame([{
         "Customer": f"TOTAL ({len(cust_display)} accounts)",
-        **( {"Excluded": "—"} if show_excluded_col else {}),
+        "Excluded": "—",
         "Salesperson": "—", "Franchise": "—", "Delivery Address": "—", "Zip": "—",
         "Spend Tier": "—", "Account Type": "—", "Customer Tier": "—",
         "2025 Avg/Q": "—",
@@ -822,9 +825,7 @@ def main():
     pq_label = fmt_quarter(prior_q) if prior_q else "Prior Q"
     cq_label = fmt_quarter(current_q)
 
-    tab_summary, tab_master, tab_full = st.tabs(
-        ["Summary", "Master Table", "Full Dataset (incl. excluded customers)"]
-    )
+    tab_summary, tab_master = st.tabs(["Summary", "Master Table"])
 
     with tab_summary:
         render_summary(df, current_q, prior_q, pq_label, cq_label)
@@ -844,26 +845,19 @@ def main():
             "Spend tier", options=all_spend_tiers, default=all_spend_tiers
         )
 
-        raw_customer_tiers = sorted(df["customer_tier"].dropna().unique().tolist())
+        raw_customer_tiers = sorted(df_full["customer_tier"].dropna().unique().tolist())
         sel_customer_tiers = st.sidebar.multiselect(
             "Customer tier", options=raw_customer_tiers, default=raw_customer_tiers
         )
 
-        tier_mask = df["customer_tier"].isin(sel_customer_tiers) | df["customer_tier"].isna()
-        df_filtered = df[
-            df["account_type"].isin(sel_account_types)
-            & df["spend_tier"].isin(sel_spend_tiers)
+        tier_mask = df_full["customer_tier"].isin(sel_customer_tiers) | df_full["customer_tier"].isna()
+        df_full_filtered = df_full[
+            df_full["account_type"].isin(sel_account_types)
+            & df_full["spend_tier"].isin(sel_spend_tiers)
             & tier_mask
         ]
 
-        render_master_table(df_filtered, current_q, prior_q, pq_label, cq_label, key_prefix="lab")
-
-    with tab_full:
-        st.caption(
-            "Unfiltered view — includes all customers, including internal Smoke Arsenal rows "
-            "excluded from the Master Table. Use this to verify the full dataset row counts and totals."
-        )
-        render_master_table(df_full, current_q, prior_q, pq_label, cq_label, key_prefix="full", show_excluded_col=True)
+        render_master_table(df_full_filtered, current_q, prior_q, pq_label, cq_label)
 
 
 if __name__ == "__main__":
