@@ -358,6 +358,8 @@ def build_master_table(df: pd.DataFrame, current_q: str, prior_q: Optional[str])
     # Growth amount = CQ revenue − 2025 avg/Q ex-STLTH, floored at 0 (shrunken accounts earn nothing)
     master["growth_amount"] = (master["cq_revenue"] - master["avg_2025_q_ex_stlth"]).clip(lower=0)
     master.loc[master["cq_revenue"] == 0, "growth_amount"] = 0.0
+    # New accounts earn only the new incentive — no growth commission
+    master.loc[master["is_new"], "growth_amount"] = 0.0
 
     # Growth commission: Low Tier 2%, Medium/High Tier 1%
     _rates = master["spend_tier"].astype(str).map(TIER_RATE).fillna(0.01)
@@ -384,12 +386,14 @@ def compute_growth_groups(master: pd.DataFrame) -> pd.DataFrame:
         .agg(
             cq_revenue=("cq_revenue", "sum"),
             avg_2025_q_ex_stlth=("avg_2025_q_ex_stlth", "sum"),
+            growth_amount=("growth_amount", "sum"),
             spend_tier=("spend_tier", "first"),
             is_franchise=("franchise", lambda x: (x != "").any()),
         )
         .reset_index()
     )
-    grp["growth_amount"] = (grp["cq_revenue"] - grp["avg_2025_q_ex_stlth"]).clip(lower=0)
+    # growth_amount is already zeroed for new accounts in build_master_table; just floor at 0
+    grp["growth_amount"] = grp["growth_amount"].clip(lower=0)
     grp.loc[grp["cq_revenue"] == 0, "growth_amount"] = 0.0
     grp["rate"] = grp["spend_tier"].astype(str).map(TIER_RATE).fillna(0.01)
     grp["growth_commission"] = (grp["growth_amount"] * grp["rate"]).round(2)
@@ -758,7 +762,7 @@ def render_master_table(df: pd.DataFrame, current_q: str, prior_q: Optional[str]
     )
     st.download_button(
         "Download master table as CSV",
-        data=cust_display[cols].to_csv(index=False).encode("utf-8"),
+        data=cust_display[cols].to_csv(index=False).encode("utf-8-sig"),
         file_name=f"master_table_{current_q}.csv",
         mime="text/csv",
     )
